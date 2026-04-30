@@ -1,0 +1,8 @@
+__pycache__/
+outputs/
+.env
+*.log
+android-app/.gradle/
+android-app/build/
+android-app/app/build/
+android-app/local.properties
