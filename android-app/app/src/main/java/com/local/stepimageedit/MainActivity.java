@@ -2,7 +2,6 @@ package com.local.stepimageedit;
 
 import android.app.Activity;
 import android.content.ContentResolver;
-import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
@@ -130,7 +129,7 @@ public class MainActivity extends Activity {
         title.setTextSize(24);
         title.setTextColor(Color.rgb(20, 27, 38));
         title.setGravity(Gravity.START);
-        title.setTypeface(null, 1);
+        title.setTypeface(null, android.graphics.Typeface.BOLD);
         root.addView(title);
 
         TextView subtitle = new TextView(this);
@@ -616,7 +615,7 @@ public class MainActivity extends Activity {
         label.setText(text);
         label.setTextSize(16);
         label.setTextColor(Color.rgb(20, 27, 38));
-        label.setTypeface(null, 1);
+        label.setTypeface(null, android.graphics.Typeface.BOLD);
         return label;
     }
 
