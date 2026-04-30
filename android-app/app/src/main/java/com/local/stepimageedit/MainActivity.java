@@ -231,15 +231,15 @@ public class MainActivity extends Activity {
 
         panel.addView(hint("原图最保真；高质JPG更稳；无损PNG避免 JPG 压缩但文件可能更大。"));
         panel.addView(spinnerRow("上传模式", new String[]{"高质JPG", "无损PNG", "原图"}, 0,
-                (parent, view, position, id) -> {
+                (parent, position) -> {
                     if (position == 1) uploadMode = "png";
                     else if (position == 2) uploadMode = "original";
                     else uploadMode = "jpg95";
                 }));
         panel.addView(spinnerRow("长边", new String[]{"1536", "2048", "3072", "4096"}, 1,
-                (parent, view, position, id) -> maxSide = Integer.parseInt((String) parent.getItemAtPosition(position))));
+                (parent, position) -> maxSide = Integer.parseInt((String) parent.getItemAtPosition(position))));
         panel.addView(spinnerRow("超时", new String[]{"75", "120", "180", "300", "600"}, 2,
-                (parent, view, position, id) -> timeoutSeconds = Integer.parseInt((String) parent.getItemAtPosition(position))));
+                (parent, position) -> timeoutSeconds = Integer.parseInt((String) parent.getItemAtPosition(position))));
 
         editButton = primaryButton("开始编辑");
         editButton.setOnClickListener(v -> startEdit());
@@ -264,7 +264,7 @@ public class MainActivity extends Activity {
         return panel;
     }
 
-    private LinearLayout spinnerRow(String title, String[] values, int selected, AdapterView.OnItemSelectedListener listener) {
+    private LinearLayout spinnerRow(String title, String[] values, int selected, SelectionHandler handler) {
         LinearLayout row = horizontal();
         row.setGravity(Gravity.CENTER_VERTICAL);
         TextView text = new TextView(this);
@@ -278,7 +278,16 @@ public class MainActivity extends Activity {
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         spinner.setAdapter(adapter);
         spinner.setSelection(selected);
-        spinner.setOnItemSelectedListener(listener);
+        spinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                handler.onSelected(parent, position);
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
         row.addView(spinner, new LinearLayout.LayoutParams(dp(150), ViewGroup.LayoutParams.WRAP_CONTENT));
         row.setPadding(0, dp(8), 0, 0);
         return row;
@@ -671,6 +680,10 @@ public class MainActivity extends Activity {
 
     private interface RequestTask {
         byte[] run() throws Exception;
+    }
+
+    private interface SelectionHandler {
+        void onSelected(AdapterView<?> parent, int position);
     }
 
     private static class UploadFile {
