@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 import zlib
+import struct
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,6 +26,7 @@ LOG_FILE = APP_DIR / "step_image_edit_gui.log"
 ENV_FILE = APP_DIR / ".env"
 RESIZE_SCRIPT = APP_DIR / "resize_image.ps1"
 REQUEST_TIMEOUT = 75
+SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 def log_message(message):
@@ -64,6 +66,8 @@ def delete_env_key():
 
 
 def normalize_upload_mode(label):
+    if label == "智能高质量":
+        return "smart"
     if label == "无损PNG":
         return "png"
     if label == "原图":
@@ -71,9 +75,103 @@ def normalize_upload_mode(label):
     return "jpg95"
 
 
+def normalize_quality_mode(label):
+    if label == "精细":
+        return "16"
+    if label == "更稳":
+        return "12"
+    return "8"
+
+
 def guess_mime(path):
     guessed, _ = mimetypes.guess_type(path)
     return guessed or "application/octet-stream"
+
+
+def unique_path(path):
+    path = Path(path)
+    if not path.exists():
+        return path
+    for index in range(1, 10000):
+        candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"无法生成唯一文件名：{path}")
+
+
+def safe_stem(path):
+    stem = Path(path).stem.strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in stem)
+    return cleaned or "image"
+
+
+def get_image_dimensions(path):
+    file_path = Path(path)
+    suffix = file_path.suffix.lower()
+    try:
+        with file_path.open("rb") as f:
+            if suffix == ".png":
+                header = f.read(24)
+                if header.startswith(b"\x89PNG\r\n\x1a\n"):
+                    return struct.unpack(">II", header[16:24])
+
+            if suffix in {".jpg", ".jpeg"}:
+                if f.read(2) != b"\xff\xd8":
+                    return None
+                while True:
+                    marker_prefix = f.read(1)
+                    if not marker_prefix:
+                        return None
+                    if marker_prefix != b"\xff":
+                        continue
+                    marker = f.read(1)
+                    while marker == b"\xff":
+                        marker = f.read(1)
+                    if marker in {b"\xd8", b"\xd9"}:
+                        continue
+                    length_bytes = f.read(2)
+                    if len(length_bytes) != 2:
+                        return None
+                    length = struct.unpack(">H", length_bytes)[0]
+                    if length < 2:
+                        return None
+                    if marker[0] in {
+                        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+                    }:
+                        data = f.read(5)
+                        if len(data) != 5:
+                            return None
+                        height, width = struct.unpack(">HH", data[1:5])
+                        return width, height
+                    f.seek(length - 2, 1)
+
+            if suffix == ".webp":
+                riff = f.read(12)
+                if len(riff) != 12 or riff[:4] != b"RIFF" or riff[8:12] != b"WEBP":
+                    return None
+                chunk = f.read(8)
+                if len(chunk) != 8:
+                    return None
+                chunk_type = chunk[:4]
+                chunk_size = struct.unpack("<I", chunk[4:8])[0]
+                data = f.read(chunk_size)
+                if chunk_type == b"VP8X" and len(data) >= 10:
+                    width = 1 + int.from_bytes(data[4:7], "little")
+                    height = 1 + int.from_bytes(data[7:10], "little")
+                    return width, height
+                if chunk_type == b"VP8 " and len(data) >= 10:
+                    width = struct.unpack("<H", data[6:8])[0] & 0x3FFF
+                    height = struct.unpack("<H", data[8:10])[0] & 0x3FFF
+                    return width, height
+                if chunk_type == b"VP8L" and len(data) >= 5:
+                    bits = int.from_bytes(data[1:5], "little")
+                    width = (bits & 0x3FFF) + 1
+                    height = ((bits >> 14) & 0x3FFF) + 1
+                    return width, height
+    except Exception as exc:
+        log_message(f"dimension read failed: {file_path.name}; {exc}")
+    return None
 
 
 def make_test_png(path):
@@ -120,16 +218,30 @@ def prepare_upload_image(path, upload_mode, max_side):
     try:
         max_side = int(max_side)
     except ValueError:
-        max_side = 1536
+        max_side = 4096
+
+    dimensions = get_image_dimensions(image_path)
+    if upload_mode == "smart":
+        if not dimensions:
+            log_message(f"smart upload original, dimension unknown: {image_path.name}")
+            return str(image_path)
+        width, height = dimensions
+        if max(width, height) <= max_side:
+            log_message(
+                f"smart upload original: {image_path.name} "
+                f"({width}x{height}, {image_path.stat().st_size / 1024 / 1024:.2f}MB)"
+            )
+            return str(image_path)
+        upload_mode = "png" if suffix == ".png" else "jpg95"
 
     cache_dir = OUTPUT_DIR / "upload-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     if upload_mode == "png":
-        out_path = cache_dir / f"{image_path.stem}-{max_side}.png"
+        out_path = cache_dir / f"{safe_stem(image_path)}-{max_side}.png"
         output_format = "png"
         quality = "100"
     else:
-        out_path = cache_dir / f"{image_path.stem}-{max_side}-q95.jpg"
+        out_path = cache_dir / f"{safe_stem(image_path)}-{max_side}-q95.jpg"
         output_format = "jpg"
         quality = "95"
     cmd = [
@@ -262,9 +374,11 @@ def send_request(req, timeout):
     return json.loads(raw.decode("utf-8"))
 
 
-def save_result(response, prefix, timeout):
-    OUTPUT_DIR.mkdir(exist_ok=True)
+def save_result(response, prefix, timeout, output_dir=None, output_stem=None):
+    target_dir = Path(output_dir) if output_dir else OUTPUT_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    name_stem = safe_stem(output_stem) if output_stem else f"{prefix}-{stamp}"
 
     if isinstance(response, dict) and response.get("raw_bytes") is not None:
         suffix = ".png"
@@ -273,7 +387,7 @@ def save_result(response, prefix, timeout):
             suffix = ".jpg"
         elif "webp" in content_type:
             suffix = ".webp"
-        out = OUTPUT_DIR / f"{prefix}-{stamp}{suffix}"
+        out = unique_path(target_dir / f"{name_stem}{suffix}")
         out.write_bytes(response["raw_bytes"])
         return out
 
@@ -284,7 +398,7 @@ def save_result(response, prefix, timeout):
     item = data[0]
     if item.get("b64_json"):
         image_bytes = base64.b64decode(item["b64_json"])
-        out = OUTPUT_DIR / f"{prefix}-{stamp}.png"
+        out = unique_path(target_dir / f"{name_stem}.png")
         out.write_bytes(image_bytes)
         return out
 
@@ -298,7 +412,7 @@ def save_result(response, prefix, timeout):
             suffix = ".jpg"
         elif "webp" in content_type:
             suffix = ".webp"
-        out = OUTPUT_DIR / f"{prefix}-{stamp}{suffix}"
+        out = unique_path(target_dir / f"{name_stem}{suffix}")
         out.write_bytes(image_bytes)
         return out
 
@@ -314,18 +428,21 @@ class StepImageEditApp:
 
         self.api_key = StringVar(value=load_env_key())
         self.image_path = StringVar()
+        self.folder_path = StringVar()
         self.mask_path = StringVar()
         self.size = StringVar(value="1024x1024")
         self.response_format = StringVar(value="b64_json")
         self.output_path = StringVar()
         self.key_status = StringVar(value="已从本地读取" if self.api_key.get() else "未保存")
         self.image_info = StringVar(value="未选择图片")
+        self.folder_info = StringVar(value="未选择文件夹")
         self.use_mask = BooleanVar(value=False)
         self.auto_resize = BooleanVar(value=True)
         self.remember_key = BooleanVar(value=True)
-        self.max_side = StringVar(value="2048")
-        self.upload_mode = StringVar(value="高质JPG")
-        self.timeout_seconds = StringVar(value="180")
+        self.max_side = StringVar(value="4096")
+        self.upload_mode = StringVar(value="智能高质量")
+        self.quality_mode = StringVar(value="标准")
+        self.timeout_seconds = StringVar(value="300")
         self.busy = False
 
         self.create_widgets()
@@ -391,6 +508,17 @@ class StepImageEditApp:
             row=2, column=1, sticky="w", padx=8, pady=(0, 4)
         )
 
+        ttk.Label(file_frame, text="文件夹").grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Entry(file_frame, textvariable=self.folder_path).grid(
+            row=3, column=1, sticky="ew", padx=8, pady=6
+        )
+        ttk.Button(file_frame, text="选择文件夹", command=self.pick_folder).grid(
+            row=3, column=2, padx=4, pady=6
+        )
+        ttk.Label(file_frame, textvariable=self.folder_info, style="Hint.TLabel").grid(
+            row=4, column=1, sticky="w", padx=8, pady=(0, 4)
+        )
+
         ttk.Checkbutton(file_frame, text="使用蒙版", variable=self.use_mask).grid(
             row=1, column=0, sticky="w", pady=6
         )
@@ -404,14 +532,6 @@ class StepImageEditApp:
 
         settings = ttk.Frame(self.edit_tab)
         settings.pack(fill="x", pady=(8, 0))
-        ttk.Label(settings, text="尺寸").pack(side="left")
-        ttk.Combobox(
-            settings,
-            textvariable=self.size,
-            values=["1024x1024", "1024x768", "768x1024", "512x512"],
-            width=14,
-            state="readonly",
-        ).pack(side="left", padx=(8, 20))
         ttk.Label(settings, text="返回格式").pack(side="left")
         ttk.Combobox(
             settings,
@@ -426,15 +546,23 @@ class StepImageEditApp:
         ttk.Combobox(
             settings,
             textvariable=self.upload_mode,
-            values=["高质JPG", "无损PNG", "原图"],
-            width=10,
+            values=["智能高质量", "高质JPG", "无损PNG", "原图"],
+            width=12,
             state="readonly",
         ).pack(side="left", padx=(0, 10))
         ttk.Label(settings, text="长边").pack(side="left")
         ttk.Combobox(
             settings,
             textvariable=self.max_side,
-            values=["1536", "2048", "3072", "4096"],
+            values=["2048", "3072", "4096"],
+            width=8,
+            state="readonly",
+        ).pack(side="left", padx=8)
+        ttk.Label(settings, text="质量").pack(side="left", padx=(12, 0))
+        ttk.Combobox(
+            settings,
+            textvariable=self.quality_mode,
+            values=["标准", "更稳", "精细"],
             width=8,
             state="readonly",
         ).pack(side="left", padx=8)
@@ -455,6 +583,8 @@ class StepImageEditApp:
         action_row = ttk.Frame(self.edit_tab)
         action_row.pack(fill="x", pady=(12, 0))
         ttk.Button(action_row, text="清空提示词", command=self.clear_prompt).pack(side="left")
+        self.batch_button = ttk.Button(action_row, text="批量处理文件夹", command=self.start_batch_edit)
+        self.batch_button.pack(side="right", padx=(8, 0))
         self.edit_button = ttk.Button(action_row, text="开始编辑", command=self.start_edit)
         self.edit_button.pack(side="right")
 
@@ -522,6 +652,12 @@ class StepImageEditApp:
             self.image_path.set(path)
             self.update_image_info(path)
 
+    def pick_folder(self):
+        path = filedialog.askdirectory(title="选择要批量处理的图片文件夹")
+        if path:
+            self.folder_path.set(path)
+            self.update_folder_info(path)
+
     def pick_mask(self):
         path = filedialog.askopenfilename(
             title="选择蒙版",
@@ -567,8 +703,26 @@ class StepImageEditApp:
         if not file_path.exists():
             self.image_info.set("图片不存在")
             return
+        dimensions = get_image_dimensions(file_path)
         size_mb = file_path.stat().st_size / 1024 / 1024
-        self.image_info.set(f"{file_path.name} | {size_mb:.2f} MB")
+        if dimensions:
+            self.image_info.set(f"{file_path.name} | {dimensions[0]}x{dimensions[1]} | {size_mb:.2f} MB")
+        else:
+            self.image_info.set(f"{file_path.name} | {size_mb:.2f} MB")
+
+    def update_folder_info(self, path):
+        folder = Path(path)
+        if not folder.exists():
+            self.folder_info.set("文件夹不存在")
+            return
+        images = self.find_folder_images(folder)
+        self.folder_info.set(f"找到 {len(images)} 张图片；输出到 stepfun_outputs 子文件夹")
+
+    def find_folder_images(self, folder):
+        return [
+            path for path in sorted(Path(folder).iterdir(), key=lambda p: p.name.lower())
+            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTS
+        ]
 
     def clear_prompt(self):
         self.edit_prompt.delete("1.0", "end")
@@ -590,6 +744,7 @@ class StepImageEditApp:
         auto_resize = self.auto_resize.get()
         max_side = self.max_side.get()
         upload_mode = normalize_upload_mode(self.upload_mode.get()) if auto_resize else "original"
+        steps = normalize_quality_mode(self.quality_mode.get())
         timeout = int(self.timeout_seconds.get())
         if not image:
             messagebox.showwarning("缺少原图", "请先选择要编辑的图片。")
@@ -615,9 +770,56 @@ class StepImageEditApp:
             "response_format": response_format,
             "upload_mode": upload_mode,
             "max_side": max_side,
+            "steps": steps,
             "timeout": timeout,
         }
         self.run_in_thread(lambda: self.edit_image(config))
+
+    def start_batch_edit(self):
+        if self.busy:
+            return
+        try:
+            key = self.get_api_key()
+        except ValueError as exc:
+            messagebox.showwarning("缺少 API Key", str(exc))
+            return
+        self.maybe_save_api_key(key)
+
+        prompt = self.edit_prompt.get("1.0", "end").strip()
+        folder = self.folder_path.get().strip()
+        if not folder:
+            messagebox.showwarning("缺少文件夹", "请先选择要批量处理的图片文件夹。")
+            return
+        folder_path = Path(folder)
+        if not folder_path.exists():
+            messagebox.showwarning("文件夹不存在", "选择的文件夹不存在。")
+            return
+        if not prompt:
+            messagebox.showwarning("缺少提示词", "请输入批量处理提示词。")
+            return
+        if len(prompt) > 512:
+            messagebox.showwarning("提示词太长", "Step Image Edit 2 的提示词最多 512 个字符。")
+            return
+
+        images = self.find_folder_images(folder_path)
+        if not images:
+            messagebox.showinfo("没有图片", "该文件夹下没有 png/jpg/jpeg/webp 图片。")
+            return
+
+        upload_mode = normalize_upload_mode(self.upload_mode.get()) if self.auto_resize.get() else "original"
+        output_dir = folder_path / "stepfun_outputs"
+        config = {
+            "api_key": key,
+            "prompt": prompt,
+            "images": images,
+            "output_dir": output_dir,
+            "response_format": self.response_format.get(),
+            "upload_mode": upload_mode,
+            "max_side": self.max_side.get(),
+            "steps": normalize_quality_mode(self.quality_mode.get()),
+            "timeout": int(self.timeout_seconds.get()),
+        }
+        self.run_in_thread(lambda: self.batch_edit_images(config))
 
     def start_generate(self):
         if self.busy:
@@ -665,6 +867,7 @@ class StepImageEditApp:
             "mask": "",
             "response_format": "b64_json",
             "upload_mode": "original",
+            "steps": "8",
             "timeout": int(self.timeout_seconds.get()),
             "is_test": True,
         }
@@ -674,6 +877,7 @@ class StepImageEditApp:
         self.busy = True
         self.status.configure(text="请求中，请稍候...")
         self.edit_button.configure(state="disabled")
+        self.batch_button.configure(state="disabled")
         self.progress.start(12)
         thread = threading.Thread(target=self.safe_run, args=(target,), daemon=True)
         thread.start()
@@ -692,7 +896,7 @@ class StepImageEditApp:
             "prompt": config["prompt"],
             "response_format": config["response_format"],
             "cfg_scale": "1.0",
-            "steps": "8",
+            "steps": config.get("steps", "8"),
         }
         if config.get("is_test"):
             fields["seed"] = "1"
@@ -712,7 +916,71 @@ class StepImageEditApp:
             files,
             config.get("timeout", REQUEST_TIMEOUT),
         )
-        return save_result(response, "edit", config.get("timeout", REQUEST_TIMEOUT))
+        return save_result(
+            response,
+            "edit",
+            config.get("timeout", REQUEST_TIMEOUT),
+            output_dir=config.get("output_dir"),
+            output_stem=config.get("output_stem"),
+        )
+
+    def batch_edit_images(self, config):
+        images = config["images"]
+        output_dir = Path(config["output_dir"])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        failures = []
+        successes = []
+        total = len(images)
+        log_message(
+            f"batch start: total={total}; output={output_dir}; "
+            f"mode={config['upload_mode']}; max_side={config['max_side']}; steps={config['steps']}"
+        )
+
+        for index, image in enumerate(images, start=1):
+            self.root.after(
+                0,
+                lambda i=index, total=total, name=image.name: self.status.configure(
+                    text=f"批量处理中 {i}/{total}: {name}"
+                ),
+            )
+            item_config = dict(config)
+            item_config["image"] = str(image)
+            item_config["mask"] = ""
+            item_config["output_stem"] = f"{safe_stem(image)}-edited"
+            try:
+                result = self.edit_image(item_config)
+                successes.append(result)
+                log_message(f"batch success: {image.name} -> {result}")
+            except Exception as exc:
+                error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+                failures.append((str(image), error))
+                log_message(f"batch failed: {image.name}; {error}")
+
+        failure_report = None
+        if failures:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            failure_report = unique_path(output_dir / f"batch-failed-{stamp}.txt")
+            lines = [
+                "Step Image Edit 2 批量处理失败清单",
+                f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                f"成功: {len(successes)}",
+                f"失败: {len(failures)}",
+                "",
+            ]
+            for image, error in failures:
+                lines.append(image)
+                lines.append(error)
+                lines.append("")
+            failure_report.write_text("\n".join(lines), encoding="utf-8")
+
+        return {
+            "type": "batch",
+            "success": len(successes),
+            "failed": len(failures),
+            "total": total,
+            "output_dir": output_dir,
+            "failure_report": failure_report,
+        }
 
     def generate_image(self, config):
         payload = {
@@ -732,7 +1000,31 @@ class StepImageEditApp:
     def finish_success(self, result_path):
         self.busy = False
         self.edit_button.configure(state="normal")
+        self.batch_button.configure(state="normal")
         self.progress.stop()
+        if isinstance(result_path, dict) and result_path.get("type") == "batch":
+            output_dir = result_path["output_dir"]
+            self.output_path.set(str(output_dir))
+            self.status.configure(
+                text=f"批量完成：成功 {result_path['success']} / {result_path['total']}，失败 {result_path['failed']}"
+            )
+            if result_path["failed"]:
+                messagebox.showwarning(
+                    "批量处理完成，有失败图片",
+                    "成功 {success} 张，失败 {failed} 张。\n失败清单：{report}".format(
+                        success=result_path["success"],
+                        failed=result_path["failed"],
+                        report=result_path["failure_report"],
+                    ),
+                )
+            else:
+                messagebox.showinfo("批量处理完成", f"全部 {result_path['total']} 张图片处理成功。")
+            try:
+                os.startfile(output_dir)
+            except OSError:
+                pass
+            return
+
         self.output_path.set(str(result_path))
         self.status.configure(text="完成")
         try:
@@ -743,6 +1035,7 @@ class StepImageEditApp:
     def finish_error(self, message):
         self.busy = False
         self.edit_button.configure(state="normal")
+        self.batch_button.configure(state="normal")
         self.progress.stop()
         self.status.configure(text="失败")
         messagebox.showerror("请求失败", message)
