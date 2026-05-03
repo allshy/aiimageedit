@@ -62,6 +62,17 @@ public class MainActivity extends Activity {
     private static final String API_URL = "https://api.stepfun.com/v1/images/edits";
     private static final String MODEL = "step-image-edit-2";
     private static final String OUTPUT_FOLDER_NAME = "stepfun_outputs";
+    private static final int DIMENSION_ALIGNMENT = 16;
+    private static final double RATIO_MATCH_TOLERANCE = 0.025;
+    private static final RatioSpec[] COMMON_RATIOS = new RatioSpec[]{
+            new RatioSpec("9:16", 9, 16),
+            new RatioSpec("2:3", 2, 3),
+            new RatioSpec("3:4", 3, 4),
+            new RatioSpec("1:1", 1, 1),
+            new RatioSpec("4:3", 4, 3),
+            new RatioSpec("3:2", 3, 2),
+            new RatioSpec("16:9", 16, 9)
+    };
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -279,7 +290,7 @@ public class MainActivity extends Activity {
         LinearLayout panel = panel();
         panel.addView(label("上传与超时"));
 
-        panel.addView(hint("智能高质量会优先上传原图；超过长边限制才重新编码，默认 4096 与 300 秒更适合高质量批量。"));
+        panel.addView(hint("智能高质量会自动识别比例，并用补边适配模型稳定尺寸；完成后裁回原尺寸。"));
         panel.addView(spinnerRow("上传模式", new String[]{"智能高质量", "高质JPG", "无损PNG", "原图"}, 0,
                 (parent, position) -> {
                     if (position == 1) uploadMode = "jpg95";
@@ -531,8 +542,12 @@ public class MainActivity extends Activity {
 
     private byte[] editImage(String apiKey, String prompt, Uri imageUri) throws Exception {
         mainHandler.post(() -> currentInfoView.setText("当前处理：" + describeUri(imageUri)));
-        UploadFile file = prepareUploadFile(imageUri);
-        return sendEditRequest(apiKey, prompt, file, timeoutSeconds);
+        PreparedUpload upload = prepareUploadFile(imageUri);
+        mainHandler.post(() -> currentInfoView.setText(
+                "当前处理：" + describeUri(imageUri) + "\n上传适配：" + upload.summary
+        ));
+        byte[] result = sendEditRequest(apiKey, prompt, upload.file, timeoutSeconds);
+        return cropResultIfNeeded(result, upload);
     }
 
     private byte[] sendEditRequest(String apiKey, String prompt, UploadFile file, int timeout) throws Exception {
@@ -567,7 +582,7 @@ public class MainActivity extends Activity {
         return parseImageResponse(response);
     }
 
-    private UploadFile prepareUploadFile(Uri uri) throws Exception {
+    private PreparedUpload prepareUploadFile(Uri uri) throws Exception {
         String originalName = getDisplayName(uri);
         if (originalName == null || originalName.trim().isEmpty()) {
             originalName = "image.jpg";
@@ -579,9 +594,15 @@ public class MainActivity extends Activity {
 
         int[] size = getImageSize(uri);
         boolean canUseOriginal = "original".equals(uploadMode)
-                || ("smart".equals(uploadMode) && size != null && Math.max(size[0], size[1]) <= maxSide);
+                || ("smart".equals(uploadMode)
+                && size != null
+                && Math.max(size[0], size[1]) <= maxSide
+                && isAligned(size[0])
+                && isAligned(size[1]));
         if (canUseOriginal) {
-            return new UploadFile("image", safeFileName(originalName), originalMime, readAll(open(uri)));
+            UploadFile file = new UploadFile("image", safeFileName(originalName), originalMime, readAll(open(uri)));
+            String summary = "原图上传 " + sizeText(size);
+            return PreparedUpload.original(file, size, summary);
         }
 
         Bitmap source;
@@ -597,21 +618,42 @@ public class MainActivity extends Activity {
             source.recycle();
         }
 
+        NormalizedSize normalized = chooseNormalizedSize(scaled.getWidth(), scaled.getHeight());
+        Bitmap uploadBitmap = padBitmap(scaled, normalized.width, normalized.height);
+        if (uploadBitmap != scaled) {
+            scaled.recycle();
+        }
+
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         String filename;
         String mime;
-        boolean usePng = "png".equals(uploadMode) || ("smart".equals(uploadMode) && scaled.hasAlpha());
+        boolean forcedPng = normalized.needsPadding || "png".equals(uploadMode);
+        boolean usePng = forcedPng || ("smart".equals(uploadMode) && uploadBitmap.hasAlpha());
         if (usePng) {
-            scaled.compress(Bitmap.CompressFormat.PNG, 100, out);
+            uploadBitmap.compress(Bitmap.CompressFormat.PNG, 100, out);
             filename = "image.png";
             mime = "image/png";
         } else {
-            scaled.compress(Bitmap.CompressFormat.JPEG, 95, out);
+            uploadBitmap.compress(Bitmap.CompressFormat.JPEG, 95, out);
             filename = "image.jpg";
             mime = "image/jpeg";
         }
-        scaled.recycle();
-        return new UploadFile("image", filename, mime, out.toByteArray());
+        uploadBitmap.recycle();
+
+        UploadFile file = new UploadFile("image", filename, mime, out.toByteArray());
+        String summary = normalized.summary + "，上传 " + normalized.width + "x" + normalized.height
+                + "，返回后裁回 " + normalized.contentWidth + "x" + normalized.contentHeight;
+        return new PreparedUpload(
+                file,
+                normalized.contentWidth,
+                normalized.contentHeight,
+                normalized.width,
+                normalized.height,
+                normalized.offsetX,
+                normalized.offsetY,
+                normalized.needsPadding,
+                summary
+        );
     }
 
     private Bitmap scaleBitmap(Bitmap source, int maxSideValue) {
@@ -625,6 +667,129 @@ public class MainActivity extends Activity {
         int outWidth = Math.max(1, Math.round(width * scale));
         int outHeight = Math.max(1, Math.round(height * scale));
         return Bitmap.createScaledBitmap(source, outWidth, outHeight, true);
+    }
+
+    private NormalizedSize chooseNormalizedSize(int width, int height) {
+        RatioSpec ratio = nearestCommonRatio(width, height);
+        int targetWidth = 0;
+        int targetHeight = 0;
+        String summary;
+
+        if (ratio != null) {
+            int unit = Math.max(ceilDiv(width, ratio.width), ceilDiv(height, ratio.height));
+            unit = alignUp(unit, DIMENSION_ALIGNMENT);
+            targetWidth = ratio.width * unit;
+            targetHeight = ratio.height * unit;
+            if (targetWidth <= maxSide && targetHeight <= maxSide) {
+                summary = "自动识别 " + ratio.label + "，补边到 16 倍数";
+            } else {
+                targetWidth = 0;
+                targetHeight = 0;
+                summary = "自动补边到 16 倍数";
+            }
+        } else {
+            summary = "自动补边到 16 倍数";
+        }
+
+        if (targetWidth <= 0 || targetHeight <= 0) {
+            targetWidth = Math.min(maxSide, alignUp(width, DIMENSION_ALIGNMENT));
+            targetHeight = Math.min(maxSide, alignUp(height, DIMENSION_ALIGNMENT));
+        }
+
+        int offsetX = Math.max(0, (targetWidth - width) / 2);
+        int offsetY = Math.max(0, (targetHeight - height) / 2);
+        boolean needsPadding = targetWidth != width || targetHeight != height;
+        if (!needsPadding) {
+            summary = "尺寸已稳定";
+        }
+        return new NormalizedSize(
+                targetWidth,
+                targetHeight,
+                width,
+                height,
+                offsetX,
+                offsetY,
+                needsPadding,
+                summary
+        );
+    }
+
+    private RatioSpec nearestCommonRatio(int width, int height) {
+        double sourceRatio = width / (double) height;
+        RatioSpec best = null;
+        double bestDiff = Double.MAX_VALUE;
+        for (RatioSpec ratio : COMMON_RATIOS) {
+            double value = ratio.width / (double) ratio.height;
+            double diff = Math.abs(sourceRatio - value) / value;
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                best = ratio;
+            }
+        }
+        return bestDiff <= RATIO_MATCH_TOLERANCE ? best : null;
+    }
+
+    private Bitmap padBitmap(Bitmap source, int targetWidth, int targetHeight) {
+        if (source.getWidth() == targetWidth && source.getHeight() == targetHeight) {
+            return source;
+        }
+        Bitmap padded = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(padded);
+        if (source.hasAlpha()) {
+            canvas.drawColor(Color.TRANSPARENT);
+        } else {
+            canvas.drawColor(source.getPixel(0, 0));
+        }
+        int left = Math.max(0, (targetWidth - source.getWidth()) / 2);
+        int top = Math.max(0, (targetHeight - source.getHeight()) / 2);
+        canvas.drawBitmap(source, left, top, null);
+        return padded;
+    }
+
+    private byte[] cropResultIfNeeded(byte[] result, PreparedUpload upload) {
+        if (!upload.needsCrop) {
+            return result;
+        }
+        Bitmap decoded = BitmapFactory.decodeByteArray(result, 0, result.length);
+        if (decoded == null) {
+            return result;
+        }
+        try {
+            if (decoded.getWidth() == upload.contentWidth && decoded.getHeight() == upload.contentHeight) {
+                return result;
+            }
+            if (decoded.getWidth() < upload.offsetX + upload.contentWidth
+                    || decoded.getHeight() < upload.offsetY + upload.contentHeight) {
+                return result;
+            }
+            Bitmap cropped = Bitmap.createBitmap(
+                    decoded,
+                    upload.offsetX,
+                    upload.offsetY,
+                    upload.contentWidth,
+                    upload.contentHeight
+            );
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            cropped.compress(Bitmap.CompressFormat.PNG, 100, out);
+            cropped.recycle();
+            return out.toByteArray();
+        } catch (Exception ignored) {
+            return result;
+        } finally {
+            decoded.recycle();
+        }
+    }
+
+    private boolean isAligned(int value) {
+        return value > 0 && value % DIMENSION_ALIGNMENT == 0;
+    }
+
+    private int alignUp(int value, int alignment) {
+        return ((value + alignment - 1) / alignment) * alignment;
+    }
+
+    private int ceilDiv(int value, int divisor) {
+        return (value + divisor - 1) / divisor;
     }
 
     private byte[] parseImageResponse(String response) throws Exception {
@@ -1019,6 +1184,13 @@ public class MainActivity extends Activity {
         return String.format(Locale.US, "%.2f MB", bytes / 1024f / 1024f);
     }
 
+    private String sizeText(int[] size) {
+        if (size == null || size.length < 2) {
+            return "尺寸未知";
+        }
+        return size[0] + "x" + size[1];
+    }
+
     private String safeFileName(String name) {
         String cleaned = name.replaceAll("[^A-Za-z0-9._-]", "_");
         return cleaned.isEmpty() ? "image.jpg" : cleaned;
@@ -1138,6 +1310,89 @@ public class MainActivity extends Activity {
             this.filename = filename;
             this.mimeType = mimeType;
             this.bytes = bytes;
+        }
+    }
+
+    private static class PreparedUpload {
+        final UploadFile file;
+        final int contentWidth;
+        final int contentHeight;
+        final int uploadWidth;
+        final int uploadHeight;
+        final int offsetX;
+        final int offsetY;
+        final boolean needsCrop;
+        final String summary;
+
+        PreparedUpload(
+                UploadFile file,
+                int contentWidth,
+                int contentHeight,
+                int uploadWidth,
+                int uploadHeight,
+                int offsetX,
+                int offsetY,
+                boolean needsCrop,
+                String summary
+        ) {
+            this.file = file;
+            this.contentWidth = contentWidth;
+            this.contentHeight = contentHeight;
+            this.uploadWidth = uploadWidth;
+            this.uploadHeight = uploadHeight;
+            this.offsetX = offsetX;
+            this.offsetY = offsetY;
+            this.needsCrop = needsCrop;
+            this.summary = summary;
+        }
+
+        static PreparedUpload original(UploadFile file, int[] size, String summary) {
+            int width = size == null || size.length < 2 ? 0 : size[0];
+            int height = size == null || size.length < 2 ? 0 : size[1];
+            return new PreparedUpload(file, width, height, width, height, 0, 0, false, summary);
+        }
+    }
+
+    private static class NormalizedSize {
+        final int width;
+        final int height;
+        final int contentWidth;
+        final int contentHeight;
+        final int offsetX;
+        final int offsetY;
+        final boolean needsPadding;
+        final String summary;
+
+        NormalizedSize(
+                int width,
+                int height,
+                int contentWidth,
+                int contentHeight,
+                int offsetX,
+                int offsetY,
+                boolean needsPadding,
+                String summary
+        ) {
+            this.width = width;
+            this.height = height;
+            this.contentWidth = contentWidth;
+            this.contentHeight = contentHeight;
+            this.offsetX = offsetX;
+            this.offsetY = offsetY;
+            this.needsPadding = needsPadding;
+            this.summary = summary;
+        }
+    }
+
+    private static class RatioSpec {
+        final String label;
+        final int width;
+        final int height;
+
+        RatioSpec(String label, int width, int height) {
+            this.label = label;
+            this.width = width;
+            this.height = height;
         }
     }
 

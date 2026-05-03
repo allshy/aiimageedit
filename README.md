@@ -69,7 +69,7 @@ Authorization: Bearer 你的API Key
 
 Android 原生工程在 `android-app` 文件夹。用 Android Studio 打开该文件夹，Gradle Sync 完成后运行 `app` 即可。
 
-Android 版已同步单张编辑、批量文件夹处理、暂停/继续、当前/输出图片信息显示、智能高质量上传、超时设置和失败清单。
+Android 版已同步单张编辑、批量文件夹处理、暂停/继续、当前/输出图片信息显示、智能高质量上传、自动比例适配、超时设置和失败清单。
 
 当前电脑没有检测到 Android SDK / Gradle，所以本机暂时无法直接打包 APK。
 
