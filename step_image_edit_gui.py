@@ -88,6 +88,18 @@ def guess_mime(path):
     return guessed or "application/octet-stream"
 
 
+def describe_image_file(path):
+    file_path = Path(path)
+    if not file_path.exists():
+        return "文件不存在"
+    suffix = file_path.suffix.lower().lstrip(".") or "unknown"
+    size_mb = file_path.stat().st_size / 1024 / 1024
+    dimensions = get_image_dimensions(file_path)
+    if dimensions:
+        return f"{file_path.name} | {suffix.upper()} | {dimensions[0]}x{dimensions[1]} | {size_mb:.2f} MB"
+    return f"{file_path.name} | {suffix.upper()} | {size_mb:.2f} MB"
+
+
 def unique_path(path):
     path = Path(path)
     if not path.exists():
@@ -436,6 +448,8 @@ class StepImageEditApp:
         self.key_status = StringVar(value="已从本地读取" if self.api_key.get() else "未保存")
         self.image_info = StringVar(value="未选择图片")
         self.folder_info = StringVar(value="未选择文件夹")
+        self.current_info = StringVar(value="当前处理：无")
+        self.output_info = StringVar(value="输出图片：无")
         self.use_mask = BooleanVar(value=False)
         self.auto_resize = BooleanVar(value=True)
         self.remember_key = BooleanVar(value=True)
@@ -444,6 +458,8 @@ class StepImageEditApp:
         self.quality_mode = StringVar(value="标准")
         self.timeout_seconds = StringVar(value="300")
         self.busy = False
+        self.pause_event = threading.Event()
+        self.pause_event.set()
 
         self.create_widgets()
 
@@ -587,6 +603,8 @@ class StepImageEditApp:
         self.batch_button.pack(side="right", padx=(8, 0))
         self.edit_button = ttk.Button(action_row, text="开始编辑", command=self.start_edit)
         self.edit_button.pack(side="right")
+        self.pause_button = ttk.Button(action_row, text="暂停", command=self.toggle_pause, state="disabled")
+        self.pause_button.pack(side="right", padx=(8, 0))
 
     def create_generate_tab(self):
         settings = ttk.Frame(self.generate_tab)
@@ -632,6 +650,12 @@ class StepImageEditApp:
         )
         ttk.Button(output, text="查看日志", command=self.open_log).grid(
             row=0, column=3, padx=(0, 10), pady=10
+        )
+        ttk.Label(output, textvariable=self.current_info, style="Hint.TLabel").grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=10, pady=(0, 4)
+        )
+        ttk.Label(output, textvariable=self.output_info, style="Hint.TLabel").grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=10, pady=(0, 10)
         )
         output.columnconfigure(0, weight=1)
 
@@ -703,12 +727,7 @@ class StepImageEditApp:
         if not file_path.exists():
             self.image_info.set("图片不存在")
             return
-        dimensions = get_image_dimensions(file_path)
-        size_mb = file_path.stat().st_size / 1024 / 1024
-        if dimensions:
-            self.image_info.set(f"{file_path.name} | {dimensions[0]}x{dimensions[1]} | {size_mb:.2f} MB")
-        else:
-            self.image_info.set(f"{file_path.name} | {size_mb:.2f} MB")
+        self.image_info.set(describe_image_file(file_path))
 
     def update_folder_info(self, path):
         folder = Path(path)
@@ -726,6 +745,16 @@ class StepImageEditApp:
 
     def clear_prompt(self):
         self.edit_prompt.delete("1.0", "end")
+
+    def toggle_pause(self):
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            self.pause_button.configure(text="继续")
+            self.status.configure(text="已请求暂停：当前图片完成后暂停")
+        else:
+            self.pause_event.set()
+            self.pause_button.configure(text="暂停")
+            self.status.configure(text="继续处理...")
 
     def start_edit(self):
         if self.busy:
@@ -819,7 +848,7 @@ class StepImageEditApp:
             "steps": normalize_quality_mode(self.quality_mode.get()),
             "timeout": int(self.timeout_seconds.get()),
         }
-        self.run_in_thread(lambda: self.batch_edit_images(config))
+        self.run_in_thread(lambda: self.batch_edit_images(config), allow_pause=True)
 
     def start_generate(self):
         if self.busy:
@@ -873,11 +902,13 @@ class StepImageEditApp:
         }
         self.run_in_thread(lambda: self.edit_image(config))
 
-    def run_in_thread(self, target):
+    def run_in_thread(self, target, allow_pause=False):
         self.busy = True
+        self.pause_event.set()
         self.status.configure(text="请求中，请稍候...")
         self.edit_button.configure(state="disabled")
         self.batch_button.configure(state="disabled")
+        self.pause_button.configure(state="normal" if allow_pause else "disabled", text="暂停")
         self.progress.start(12)
         thread = threading.Thread(target=self.safe_run, args=(target,), daemon=True)
         thread.start()
@@ -891,6 +922,11 @@ class StepImageEditApp:
             self.root.after(0, lambda: self.finish_error(details))
 
     def edit_image(self, config):
+        image_path = Path(config["image"])
+        self.root.after(
+            0,
+            lambda p=image_path: self.current_info.set(f"当前处理：{describe_image_file(p)}"),
+        )
         fields = {
             "model": MODEL_NAME,
             "prompt": config["prompt"],
@@ -916,13 +952,18 @@ class StepImageEditApp:
             files,
             config.get("timeout", REQUEST_TIMEOUT),
         )
-        return save_result(
+        result_path = save_result(
             response,
             "edit",
             config.get("timeout", REQUEST_TIMEOUT),
             output_dir=config.get("output_dir"),
             output_stem=config.get("output_stem"),
         )
+        self.root.after(
+            0,
+            lambda p=result_path: self.output_info.set(f"输出图片：{describe_image_file(p)}"),
+        )
+        return result_path
 
     def batch_edit_images(self, config):
         images = config["images"]
@@ -937,10 +978,21 @@ class StepImageEditApp:
         )
 
         for index, image in enumerate(images, start=1):
+            if not self.pause_event.is_set():
+                self.root.after(
+                    0,
+                    lambda name=image.name: self.status.configure(
+                        text=f"已暂停，下一张待处理：{name}"
+                    ),
+                )
+            while not self.pause_event.is_set():
+                time.sleep(0.2)
+
             self.root.after(
                 0,
-                lambda i=index, total=total, name=image.name: self.status.configure(
-                    text=f"批量处理中 {i}/{total}: {name}"
+                lambda i=index, total=total, img=image: (
+                    self.status.configure(text=f"批量处理中 {i}/{total}: {img.name}"),
+                    self.current_info.set(f"当前处理：{describe_image_file(img)}"),
                 ),
             )
             item_config = dict(config)
@@ -999,8 +1051,10 @@ class StepImageEditApp:
 
     def finish_success(self, result_path):
         self.busy = False
+        self.pause_event.set()
         self.edit_button.configure(state="normal")
         self.batch_button.configure(state="normal")
+        self.pause_button.configure(state="disabled", text="暂停")
         self.progress.stop()
         if isinstance(result_path, dict) and result_path.get("type") == "batch":
             output_dir = result_path["output_dir"]
@@ -1026,6 +1080,7 @@ class StepImageEditApp:
             return
 
         self.output_path.set(str(result_path))
+        self.output_info.set(f"输出图片：{describe_image_file(result_path)}")
         self.status.configure(text="完成")
         try:
             os.startfile(result_path)
@@ -1034,8 +1089,10 @@ class StepImageEditApp:
 
     def finish_error(self, message):
         self.busy = False
+        self.pause_event.set()
         self.edit_button.configure(state="normal")
         self.batch_button.configure(state="normal")
+        self.pause_button.configure(state="disabled", text="暂停")
         self.progress.stop()
         self.status.configure(text="失败")
         messagebox.showerror("请求失败", message)
