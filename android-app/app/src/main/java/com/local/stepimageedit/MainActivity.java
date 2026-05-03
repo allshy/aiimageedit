@@ -15,6 +15,7 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.util.Base64;
@@ -37,6 +38,7 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -46,7 +48,9 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -54,28 +58,38 @@ import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
     private static final int REQ_PICK_IMAGE = 1001;
+    private static final int REQ_PICK_FOLDER = 1002;
     private static final String API_URL = "https://api.stepfun.com/v1/images/edits";
     private static final String MODEL = "step-image-edit-2";
+    private static final String OUTPUT_FOLDER_NAME = "stepfun_outputs";
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Object pauseLock = new Object();
 
     private EditText apiKeyInput;
     private EditText promptInput;
     private CheckBox rememberKeyCheck;
     private TextView keyStatusView;
     private TextView imageInfoView;
+    private TextView folderInfoView;
     private TextView statusView;
     private TextView outputPathView;
+    private TextView currentInfoView;
+    private TextView outputInfoView;
     private ImageView inputPreview;
     private ImageView outputPreview;
     private ProgressBar progressBar;
     private Button editButton;
+    private Button batchButton;
+    private Button pauseButton;
 
     private Uri selectedImageUri;
-    private String uploadMode = "jpg95";
-    private int maxSide = 2048;
-    private int timeoutSeconds = 180;
+    private Uri selectedFolderUri;
+    private String uploadMode = "smart";
+    private int maxSide = 4096;
+    private int timeoutSeconds = 300;
+    private volatile boolean pauseRequested = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -86,27 +100,55 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        super.onDestroy();
+        synchronized (pauseLock) {
+            pauseRequested = false;
+            pauseLock.notifyAll();
+        }
         executor.shutdownNow();
+        super.onDestroy();
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQ_PICK_IMAGE && resultCode == RESULT_OK && data != null) {
-            selectedImageUri = data.getData();
-            if (selectedImageUri != null) {
-                try {
-                    getContentResolver().takePersistableUriPermission(
-                            selectedImageUri,
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    );
-                } catch (SecurityException ignored) {
-                    // Some document providers do not grant persistable permissions.
-                }
-                inputPreview.setImageURI(selectedImageUri);
-                imageInfoView.setText(describeUri(selectedImageUri));
-            }
+        if (resultCode != RESULT_OK || data == null) {
+            return;
+        }
+        if (requestCode == REQ_PICK_IMAGE) {
+            handlePickedImage(data);
+        } else if (requestCode == REQ_PICK_FOLDER) {
+            handlePickedFolder(data);
+        }
+    }
+
+    private void handlePickedImage(Intent data) {
+        selectedImageUri = data.getData();
+        if (selectedImageUri == null) {
+            return;
+        }
+        takeReadPermission(selectedImageUri, data.getFlags());
+        inputPreview.setImageURI(selectedImageUri);
+        imageInfoView.setText(describeUri(selectedImageUri));
+        currentInfoView.setText("当前处理：无");
+    }
+
+    private void handlePickedFolder(Intent data) {
+        selectedFolderUri = data.getData();
+        if (selectedFolderUri == null) {
+            return;
+        }
+        int flags = data.getFlags()
+                & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        try {
+            getContentResolver().takePersistableUriPermission(selectedFolderUri, flags);
+        } catch (Exception ignored) {
+            // Some providers grant temporary access only.
+        }
+        try {
+            List<BatchImage> images = listFolderImages(selectedFolderUri);
+            folderInfoView.setText("找到 " + images.size() + " 张图片；输出到 " + OUTPUT_FOLDER_NAME);
+        } catch (Exception exc) {
+            folderInfoView.setText("文件夹读取失败：" + safeMessage(exc));
         }
     }
 
@@ -133,7 +175,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("本地保存 Key，手机端直接编辑图片");
+        subtitle.setText("本地保存 Key，手机端直接编辑或批量处理图片");
         subtitle.setTextSize(14);
         subtitle.setTextColor(Color.rgb(86, 98, 116));
         root.addView(subtitle, lpMatchWrap(0, 4, 0, 14));
@@ -209,6 +251,14 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(220)
         ));
+
+        panel.addView(label("批量文件夹"), lpMatchWrap(0, 12, 0, 0));
+        Button folderButton = secondaryButton("选择文件夹");
+        folderButton.setOnClickListener(v -> pickFolder());
+        panel.addView(folderButton, lpMatchWrap(0, 6, 0, 8));
+
+        folderInfoView = hint("未选择文件夹");
+        panel.addView(folderInfoView);
         return panel;
     }
 
@@ -229,21 +279,33 @@ public class MainActivity extends Activity {
         LinearLayout panel = panel();
         panel.addView(label("上传与超时"));
 
-        panel.addView(hint("原图最保真；高质JPG更稳；无损PNG避免 JPG 压缩但文件可能更大。"));
-        panel.addView(spinnerRow("上传模式", new String[]{"高质JPG", "无损PNG", "原图"}, 0,
+        panel.addView(hint("智能高质量会优先上传原图；超过长边限制才重新编码，默认 4096 与 300 秒更适合高质量批量。"));
+        panel.addView(spinnerRow("上传模式", new String[]{"智能高质量", "高质JPG", "无损PNG", "原图"}, 0,
                 (parent, position) -> {
-                    if (position == 1) uploadMode = "png";
-                    else if (position == 2) uploadMode = "original";
-                    else uploadMode = "jpg95";
+                    if (position == 1) uploadMode = "jpg95";
+                    else if (position == 2) uploadMode = "png";
+                    else if (position == 3) uploadMode = "original";
+                    else uploadMode = "smart";
                 }));
-        panel.addView(spinnerRow("长边", new String[]{"1536", "2048", "3072", "4096"}, 1,
+        panel.addView(spinnerRow("长边", new String[]{"1536", "2048", "3072", "4096"}, 3,
                 (parent, position) -> maxSide = Integer.parseInt((String) parent.getItemAtPosition(position))));
-        panel.addView(spinnerRow("超时", new String[]{"75", "120", "180", "300", "600"}, 2,
+        panel.addView(spinnerRow("超时", new String[]{"75", "120", "180", "300", "600"}, 3,
                 (parent, position) -> timeoutSeconds = Integer.parseInt((String) parent.getItemAtPosition(position))));
 
+        LinearLayout row = horizontal();
         editButton = primaryButton("开始编辑");
         editButton.setOnClickListener(v -> startEdit());
-        panel.addView(editButton, lpMatchWrap(0, 10, 0, 0));
+        row.addView(editButton, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+
+        batchButton = secondaryButton("批量处理");
+        batchButton.setOnClickListener(v -> startBatchEdit());
+        row.addView(batchButton, lpWeighted(1, 8, 0, 0, 0));
+
+        pauseButton = secondaryButton("暂停");
+        pauseButton.setEnabled(false);
+        pauseButton.setOnClickListener(v -> togglePause());
+        row.addView(pauseButton, lpWeighted(0.8f, 8, 0, 0, 0));
+        panel.addView(row, lpMatchWrap(0, 10, 0, 0));
         return panel;
     }
 
@@ -261,6 +323,12 @@ public class MainActivity extends Activity {
 
         outputPathView = hint("还没有结果");
         panel.addView(outputPathView, lpMatchWrap(0, 8, 0, 0));
+
+        currentInfoView = hint("当前处理：无");
+        panel.addView(currentInfoView, lpMatchWrap(0, 8, 0, 0));
+
+        outputInfoView = hint("输出图片：无");
+        panel.addView(outputInfoView, lpMatchWrap(0, 4, 0, 0));
         return panel;
     }
 
@@ -288,7 +356,7 @@ public class MainActivity extends Activity {
             public void onNothingSelected(AdapterView<?> parent) {
             }
         });
-        row.addView(spinner, new LinearLayout.LayoutParams(dp(150), ViewGroup.LayoutParams.WRAP_CONTENT));
+        row.addView(spinner, new LinearLayout.LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT));
         row.setPadding(0, dp(8), 0, 0);
         return row;
     }
@@ -301,27 +369,58 @@ public class MainActivity extends Activity {
         startActivityForResult(intent, REQ_PICK_IMAGE);
     }
 
+    private void pickFolder() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        intent.addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+                        | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                        | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        );
+        startActivityForResult(intent, REQ_PICK_FOLDER);
+    }
+
     private void startEdit() {
         String apiKey = apiKeyInput.getText().toString().trim();
         String prompt = promptInput.getText().toString().trim();
-        if (apiKey.isEmpty()) {
-            toast("请先填写 API Key");
+        if (!validateCommon(apiKey, prompt)) {
             return;
         }
         if (selectedImageUri == null) {
             toast("请先选择图片");
             return;
         }
-        if (prompt.isEmpty()) {
-            toast("请输入提示词");
+        maybeSaveKey(apiKey);
+        runSingleRequest(() -> editImage(apiKey, prompt, selectedImageUri));
+    }
+
+    private void startBatchEdit() {
+        String apiKey = apiKeyInput.getText().toString().trim();
+        String prompt = promptInput.getText().toString().trim();
+        if (!validateCommon(apiKey, prompt)) {
             return;
         }
-        if (prompt.length() > 512) {
-            toast("提示词最多 512 个字符");
+        if (selectedFolderUri == null) {
+            toast("请先选择批量文件夹");
             return;
         }
         maybeSaveKey(apiKey);
-        runRequest(() -> editImage(apiKey, prompt, selectedImageUri, false));
+        runBatchRequest(apiKey, prompt, selectedFolderUri);
+    }
+
+    private boolean validateCommon(String apiKey, String prompt) {
+        if (apiKey.isEmpty()) {
+            toast("请先填写 API Key");
+            return false;
+        }
+        if (prompt.isEmpty()) {
+            toast("请输入提示词");
+            return false;
+        }
+        if (prompt.length() > 512) {
+            toast("提示词最多 512 个字符");
+            return false;
+        }
+        return true;
     }
 
     private void startApiTest() {
@@ -331,34 +430,107 @@ public class MainActivity extends Activity {
             return;
         }
         maybeSaveKey(apiKey);
-        runRequest(() -> {
-            UploadFile testFile = new UploadFile("image", "api_test.png", "image/png", createTestPng());
+        runSingleRequest(() -> {
+            byte[] png = createTestPng();
+            mainHandler.post(() -> currentInfoView.setText(
+                    "当前处理：" + describeOutputBytes("api_test.png", png)
+            ));
+            UploadFile testFile = new UploadFile("image", "api_test.png", "image/png", png);
             return sendEditRequest(apiKey, "把蓝色方块改成红色方块", testFile, timeoutSeconds);
         });
     }
 
-    private void runRequest(RequestTask task) {
-        setBusy(true, "请求中...");
+    private void runSingleRequest(RequestTask task) {
+        setBusy(true, "请求中...", false);
         executor.execute(() -> {
             try {
                 byte[] result = task.run();
                 File out = saveOutput(result);
                 mainHandler.post(() -> {
-                    setBusy(false, "完成");
+                    setBusy(false, "完成", false);
                     outputPreview.setImageURI(Uri.fromFile(out));
                     outputPathView.setText(out.getAbsolutePath());
+                    outputInfoView.setText("输出图片：" + describeFile(out));
                     toast("已保存结果");
                 });
             } catch (Exception e) {
                 mainHandler.post(() -> {
-                    setBusy(false, "失败");
-                    toast(e.getMessage() == null ? "请求失败" : e.getMessage());
+                    setBusy(false, "失败", false);
+                    toast(safeMessage(e));
                 });
             }
         });
     }
 
-    private byte[] editImage(String apiKey, String prompt, Uri imageUri, boolean isTest) throws Exception {
+    private void runBatchRequest(String apiKey, String prompt, Uri folderUri) {
+        setBusy(true, "准备批量处理...", true);
+        executor.execute(() -> {
+            int success = 0;
+            List<String> failures = new ArrayList<>();
+            Uri outputDirUri = null;
+            try {
+                List<BatchImage> images = listFolderImages(folderUri);
+                if (images.isEmpty()) {
+                    throw new Exception("文件夹里没有 png/jpg/jpeg/webp 图片");
+                }
+                outputDirUri = getOrCreateOutputDir(folderUri);
+                Uri finalOutputDirUri = outputDirUri;
+                mainHandler.post(() -> {
+                    folderInfoView.setText("找到 " + images.size() + " 张图片；输出到 " + OUTPUT_FOLDER_NAME);
+                    outputPathView.setText(finalOutputDirUri.toString());
+                });
+
+                for (int i = 0; i < images.size(); i++) {
+                    BatchImage image = images.get(i);
+                    waitIfPaused(image.name);
+                    int index = i + 1;
+                    mainHandler.post(() -> {
+                        statusView.setText("批量处理中 " + index + "/" + images.size() + ": " + image.name);
+                        currentInfoView.setText("当前处理：" + describeUri(image.uri, image.name, image.size));
+                    });
+                    try {
+                        byte[] result = editImage(apiKey, prompt, image.uri);
+                        String outputName = safeStem(image.name) + "-edited.png";
+                        Uri outUri = saveOutputDocument(outputDirUri, outputName, result);
+                        success++;
+                        mainHandler.post(() -> {
+                            outputPathView.setText(outUri.toString());
+                            outputInfoView.setText("输出图片：" + describeOutputBytes(outputName, result));
+                        });
+                    } catch (Exception exc) {
+                        failures.add(image.name + " | " + safeMessage(exc));
+                    }
+                }
+
+                Uri reportUri = null;
+                if (!failures.isEmpty()) {
+                    reportUri = saveFailureReport(outputDirUri, images.size(), success, failures);
+                }
+                Uri finalReportUri = reportUri;
+                int finalSuccess = success;
+                mainHandler.post(() -> {
+                    setBusy(false, "批量完成：成功 " + finalSuccess + " / " + images.size()
+                            + "，失败 " + failures.size(), false);
+                    if (failures.isEmpty()) {
+                        toast("批量完成，全部成功");
+                    } else {
+                        toast("批量完成，有 " + failures.size() + " 张失败，失败清单已保存");
+                        outputPathView.setText(finalReportUri == null ? outputPathView.getText() : finalReportUri.toString());
+                    }
+                });
+            } catch (InterruptedException exc) {
+                mainHandler.post(() -> setBusy(false, "已停止", false));
+            } catch (Exception exc) {
+                mainHandler.post(() -> {
+                    setBusy(false, "失败", false);
+                    toast(safeMessage(exc));
+                });
+            }
+        });
+    }
+
+    private byte[] editImage(String apiKey, String prompt, Uri imageUri) throws Exception {
+        mainHandler.post(() -> currentInfoView.setText("当前处理：" + describeUri(imageUri)));
         UploadFile file = prepareUploadFile(imageUri);
         return sendEditRequest(apiKey, prompt, file, timeoutSeconds);
     }
@@ -396,12 +568,20 @@ public class MainActivity extends Activity {
     }
 
     private UploadFile prepareUploadFile(Uri uri) throws Exception {
-        if ("original".equals(uploadMode)) {
-            String name = getDisplayName(uri);
-            if (name == null || name.trim().isEmpty()) name = "image.jpg";
-            String mime = getContentResolver().getType(uri);
-            if (mime == null) mime = "application/octet-stream";
-            return new UploadFile("image", safeFileName(name), mime, readAll(open(uri)));
+        String originalName = getDisplayName(uri);
+        if (originalName == null || originalName.trim().isEmpty()) {
+            originalName = "image.jpg";
+        }
+        String originalMime = getContentResolver().getType(uri);
+        if (originalMime == null) {
+            originalMime = "application/octet-stream";
+        }
+
+        int[] size = getImageSize(uri);
+        boolean canUseOriginal = "original".equals(uploadMode)
+                || ("smart".equals(uploadMode) && size != null && Math.max(size[0], size[1]) <= maxSide);
+        if (canUseOriginal) {
+            return new UploadFile("image", safeFileName(originalName), originalMime, readAll(open(uri)));
         }
 
         Bitmap source;
@@ -420,7 +600,8 @@ public class MainActivity extends Activity {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         String filename;
         String mime;
-        if ("png".equals(uploadMode)) {
+        boolean usePng = "png".equals(uploadMode) || ("smart".equals(uploadMode) && scaled.hasAlpha());
+        if (usePng) {
             scaled.compress(Bitmap.CompressFormat.PNG, 100, out);
             filename = "image.png";
             mime = "image/png";
@@ -465,6 +646,151 @@ public class MainActivity extends Activity {
         throw new Exception("API 响应里没有 b64_json 或 url");
     }
 
+    private List<BatchImage> listFolderImages(Uri treeUri) throws Exception {
+        List<BatchImage> images = new ArrayList<>();
+        String treeDocId = DocumentsContract.getTreeDocumentId(treeUri);
+        Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId);
+        String[] projection = new String[]{
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE
+        };
+        try (Cursor cursor = getContentResolver().query(childrenUri, projection, null, null,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME + " ASC")) {
+            if (cursor == null) {
+                return images;
+            }
+            while (cursor.moveToNext()) {
+                String docId = cursor.getString(0);
+                String name = cursor.getString(1);
+                String mime = cursor.getString(2);
+                long size = cursor.isNull(3) ? -1 : cursor.getLong(3);
+                if (!isSupportedImage(name, mime)) {
+                    continue;
+                }
+                Uri imageUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
+                images.add(new BatchImage(imageUri, name == null ? "image" : name, mime, size));
+            }
+        }
+        return images;
+    }
+
+    private boolean isSupportedImage(String name, String mime) {
+        if (mime != null && mime.startsWith("image/")) {
+            return true;
+        }
+        String lower = name == null ? "" : name.toLowerCase(Locale.US);
+        return lower.endsWith(".png")
+                || lower.endsWith(".jpg")
+                || lower.endsWith(".jpeg")
+                || lower.endsWith(".webp");
+    }
+
+    private Uri getOrCreateOutputDir(Uri treeUri) throws Exception {
+        String treeDocId = DocumentsContract.getTreeDocumentId(treeUri);
+        Uri rootDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocId);
+        Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, treeDocId);
+        String[] projection = new String[]{
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE
+        };
+        try (Cursor cursor = getContentResolver().query(childrenUri, projection, null, null, null)) {
+            if (cursor != null) {
+                while (cursor.moveToNext()) {
+                    String docId = cursor.getString(0);
+                    String name = cursor.getString(1);
+                    String mime = cursor.getString(2);
+                    if (OUTPUT_FOLDER_NAME.equals(name)
+                            && DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+                        return DocumentsContract.buildDocumentUriUsingTree(treeUri, docId);
+                    }
+                }
+            }
+        }
+        Uri created = DocumentsContract.createDocument(
+                getContentResolver(),
+                rootDocUri,
+                DocumentsContract.Document.MIME_TYPE_DIR,
+                OUTPUT_FOLDER_NAME
+        );
+        if (created == null) {
+            throw new Exception("无法创建输出文件夹");
+        }
+        return created;
+    }
+
+    private Uri saveOutputDocument(Uri outputDirUri, String name, byte[] bytes) throws Exception {
+        Uri outUri = DocumentsContract.createDocument(
+                getContentResolver(),
+                outputDirUri,
+                "image/png",
+                name
+        );
+        if (outUri == null) {
+            throw new Exception("无法创建输出图片");
+        }
+        try (OutputStream out = getContentResolver().openOutputStream(outUri, "w")) {
+            if (out == null) {
+                throw new Exception("无法写入输出图片");
+            }
+            out.write(bytes);
+        }
+        return outUri;
+    }
+
+    private Uri saveFailureReport(Uri outputDirUri, int total, int success, List<String> failures) throws Exception {
+        String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
+        Uri reportUri = DocumentsContract.createDocument(
+                getContentResolver(),
+                outputDirUri,
+                "text/plain",
+                "batch-failed-" + stamp + ".txt"
+        );
+        if (reportUri == null) {
+            return null;
+        }
+        StringBuilder builder = new StringBuilder();
+        builder.append("Step Image Edit 2 批量处理失败清单\n\n");
+        builder.append("总数: ").append(total).append('\n');
+        builder.append("成功: ").append(success).append('\n');
+        builder.append("失败: ").append(failures.size()).append("\n\n");
+        for (String failure : failures) {
+            builder.append(failure).append('\n');
+        }
+        try (OutputStream out = getContentResolver().openOutputStream(reportUri, "w")) {
+            if (out != null) {
+                out.write(builder.toString().getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        return reportUri;
+    }
+
+    private void waitIfPaused(String nextName) throws InterruptedException {
+        synchronized (pauseLock) {
+            while (pauseRequested) {
+                mainHandler.post(() -> statusView.setText("已暂停，下一张待处理：" + nextName));
+                pauseLock.wait();
+            }
+        }
+    }
+
+    private void togglePause() {
+        synchronized (pauseLock) {
+            if (pauseRequested) {
+                pauseRequested = false;
+                pauseButton.setText("暂停");
+                statusView.setText("继续处理...");
+                pauseLock.notifyAll();
+            } else {
+                pauseRequested = true;
+                pauseButton.setText("继续");
+                statusView.setText("已请求暂停：当前图片完成后暂停");
+            }
+        }
+    }
+
     private void addFormField(ByteArrayOutputStream body, String boundary, String name, String value) throws Exception {
         body.write(("--" + boundary + "\r\n").getBytes(StandardCharsets.UTF_8));
         body.write(("Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n").getBytes(StandardCharsets.UTF_8));
@@ -495,7 +821,9 @@ public class MainActivity extends Activity {
 
     private File saveOutput(byte[] bytes) throws Exception {
         File dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES);
-        if (dir == null) dir = getFilesDir();
+        if (dir == null) {
+            dir = getFilesDir();
+        }
         if (!dir.exists() && !dir.mkdirs()) {
             throw new Exception("无法创建输出目录");
         }
@@ -515,7 +843,9 @@ public class MainActivity extends Activity {
     }
 
     private void maybeSaveKey(String key) {
-        if (!rememberKeyCheck.isChecked()) return;
+        if (!rememberKeyCheck.isChecked()) {
+            return;
+        }
         getSharedPreferences("settings", MODE_PRIVATE)
                 .edit()
                 .putString("api_key", key)
@@ -543,27 +873,85 @@ public class MainActivity extends Activity {
         toast("已清除本地 Key");
     }
 
-    private void setBusy(boolean busy, String status) {
+    private void setBusy(boolean busy, String status, boolean allowPause) {
+        pauseRequested = false;
         editButton.setEnabled(!busy);
+        batchButton.setEnabled(!busy);
+        pauseButton.setEnabled(busy && allowPause);
+        pauseButton.setText("暂停");
         progressBar.setVisibility(busy ? View.VISIBLE : View.GONE);
         statusView.setText(status);
     }
 
     private String describeUri(Uri uri) {
-        String name = getDisplayName(uri);
-        long size = getSize(uri);
-        if (name == null) name = "已选择图片";
-        if (size > 0) {
-            return name + " | " + String.format(Locale.US, "%.2f MB", size / 1024f / 1024f);
+        return describeUri(uri, getDisplayName(uri), getSize(uri));
+    }
+
+    private String describeUri(Uri uri, String name, long knownSize) {
+        if (name == null) {
+            name = "已选择图片";
         }
-        return name;
+        String format = formatName(getContentResolver().getType(uri), name);
+        int[] size = getImageSize(uri);
+        StringBuilder builder = new StringBuilder();
+        builder.append(name).append(" | ").append(format);
+        if (size != null) {
+            builder.append(" | ").append(size[0]).append("x").append(size[1]);
+        }
+        if (knownSize > 0) {
+            builder.append(" | ").append(formatBytes(knownSize));
+        }
+        return builder.toString();
+    }
+
+    private String describeFile(File file) {
+        String name = file.getName();
+        String format = formatName(null, name);
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(file.getAbsolutePath(), options);
+        StringBuilder builder = new StringBuilder();
+        builder.append(name).append(" | ").append(format);
+        if (options.outWidth > 0 && options.outHeight > 0) {
+            builder.append(" | ").append(options.outWidth).append("x").append(options.outHeight);
+        }
+        builder.append(" | ").append(formatBytes(file.length()));
+        return builder.toString();
+    }
+
+    private String describeOutputBytes(String name, byte[] bytes) {
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        BitmapFactory.decodeStream(new ByteArrayInputStream(bytes), null, options);
+        StringBuilder builder = new StringBuilder();
+        builder.append(name).append(" | PNG");
+        if (options.outWidth > 0 && options.outHeight > 0) {
+            builder.append(" | ").append(options.outWidth).append("x").append(options.outHeight);
+        }
+        builder.append(" | ").append(formatBytes(bytes.length));
+        return builder.toString();
+    }
+
+    private int[] getImageSize(Uri uri) {
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        try (InputStream in = open(uri)) {
+            BitmapFactory.decodeStream(in, null, options);
+            if (options.outWidth > 0 && options.outHeight > 0) {
+                return new int[]{options.outWidth, options.outHeight};
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     private String getDisplayName(Uri uri) {
         try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
                 int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
-                if (index >= 0) return cursor.getString(index);
+                if (index >= 0) {
+                    return cursor.getString(index);
+                }
             }
         } catch (Exception ignored) {
         }
@@ -574,7 +962,9 @@ public class MainActivity extends Activity {
         try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
                 int index = cursor.getColumnIndex(OpenableColumns.SIZE);
-                if (index >= 0) return cursor.getLong(index);
+                if (index >= 0 && !cursor.isNull(index)) {
+                    return cursor.getLong(index);
+                }
             }
         } catch (Exception ignored) {
         }
@@ -584,12 +974,25 @@ public class MainActivity extends Activity {
     private InputStream open(Uri uri) throws Exception {
         ContentResolver resolver = getContentResolver();
         InputStream in = resolver.openInputStream(uri);
-        if (in == null) throw new Exception("无法打开图片");
+        if (in == null) {
+            throw new Exception("无法打开图片");
+        }
         return in;
     }
 
+    private void takeReadPermission(Uri uri, int sourceFlags) {
+        int flags = sourceFlags & Intent.FLAG_GRANT_READ_URI_PERMISSION;
+        try {
+            getContentResolver().takePersistableUriPermission(uri, flags);
+        } catch (Exception ignored) {
+            // Some document providers do not grant persistable permissions.
+        }
+    }
+
     private byte[] readAll(InputStream in) throws Exception {
-        if (in == null) return new byte[0];
+        if (in == null) {
+            return new byte[0];
+        }
         try (InputStream input = in; ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[16 * 1024];
             int read;
@@ -600,9 +1003,39 @@ public class MainActivity extends Activity {
         }
     }
 
+    private String formatName(String mime, String name) {
+        if (mime != null && mime.startsWith("image/")) {
+            return mime.substring("image/".length()).toUpperCase(Locale.US);
+        }
+        String lower = name == null ? "" : name.toLowerCase(Locale.US);
+        int dot = lower.lastIndexOf('.');
+        if (dot >= 0 && dot < lower.length() - 1) {
+            return lower.substring(dot + 1).toUpperCase(Locale.US);
+        }
+        return "UNKNOWN";
+    }
+
+    private String formatBytes(long bytes) {
+        return String.format(Locale.US, "%.2f MB", bytes / 1024f / 1024f);
+    }
+
     private String safeFileName(String name) {
         String cleaned = name.replaceAll("[^A-Za-z0-9._-]", "_");
         return cleaned.isEmpty() ? "image.jpg" : cleaned;
+    }
+
+    private String safeStem(String name) {
+        String cleaned = safeFileName(name);
+        int dot = cleaned.lastIndexOf('.');
+        if (dot > 0) {
+            cleaned = cleaned.substring(0, dot);
+        }
+        return cleaned.isEmpty() ? "image" : cleaned;
+    }
+
+    private String safeMessage(Exception exc) {
+        String message = exc.getMessage();
+        return message == null || message.trim().isEmpty() ? "请求失败" : message;
     }
 
     private LinearLayout panel() {
@@ -640,6 +1073,7 @@ public class MainActivity extends Activity {
         Button button = new Button(this);
         button.setText(text);
         button.setTextColor(Color.WHITE);
+        button.setAllCaps(false);
         button.setBackgroundResource(getResources().getIdentifier("button_primary", "drawable", getPackageName()));
         return button;
     }
@@ -648,6 +1082,7 @@ public class MainActivity extends Activity {
         Button button = new Button(this);
         button.setText(text);
         button.setTextColor(Color.rgb(30, 42, 58));
+        button.setAllCaps(false);
         button.setBackgroundResource(getResources().getIdentifier("button_secondary", "drawable", getPackageName()));
         return button;
     }
@@ -666,6 +1101,12 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         );
+        lp.setMargins(dp(left), dp(top), dp(right), dp(bottom));
+        return lp;
+    }
+
+    private LinearLayout.LayoutParams lpWeighted(float weight, int left, int top, int right, int bottom) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, weight);
         lp.setMargins(dp(left), dp(top), dp(right), dp(bottom));
         return lp;
     }
@@ -697,6 +1138,20 @@ public class MainActivity extends Activity {
             this.filename = filename;
             this.mimeType = mimeType;
             this.bytes = bytes;
+        }
+    }
+
+    private static class BatchImage {
+        final Uri uri;
+        final String name;
+        final String mime;
+        final long size;
+
+        BatchImage(Uri uri, String name, String mime, long size) {
+            this.uri = uri;
+            this.name = name;
+            this.mime = mime;
+            this.size = size;
         }
     }
 }
