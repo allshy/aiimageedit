@@ -81,6 +81,7 @@ public class MainActivity extends Activity {
     private EditText apiKeyInput;
     private EditText promptInput;
     private CheckBox rememberKeyCheck;
+    private CheckBox privatePreviewCheck;
     private TextView keyStatusView;
     private TextView imageInfoView;
     private TextView folderInfoView;
@@ -100,6 +101,7 @@ public class MainActivity extends Activity {
     private String uploadMode = "smart";
     private int maxSide = 4096;
     private int timeoutSeconds = 300;
+    private int repeatCount = 1;
     private volatile boolean pauseRequested = false;
 
     @Override
@@ -139,6 +141,7 @@ public class MainActivity extends Activity {
         }
         takeReadPermission(selectedImageUri, data.getFlags());
         inputPreview.setImageURI(selectedImageUri);
+        applyPreviewPrivacy();
         imageInfoView.setText(describeUri(selectedImageUri));
         currentInfoView.setText("当前处理：无");
     }
@@ -302,6 +305,8 @@ public class MainActivity extends Activity {
                 (parent, position) -> maxSide = Integer.parseInt((String) parent.getItemAtPosition(position))));
         panel.addView(spinnerRow("超时", new String[]{"75", "120", "180", "300", "600"}, 3,
                 (parent, position) -> timeoutSeconds = Integer.parseInt((String) parent.getItemAtPosition(position))));
+        panel.addView(spinnerRow("处理次数", new String[]{"1", "2", "3", "4", "5", "10"}, 0,
+                (parent, position) -> repeatCount = Integer.parseInt((String) parent.getItemAtPosition(position))));
 
         LinearLayout row = horizontal();
         editButton = primaryButton("开始编辑");
@@ -323,6 +328,12 @@ public class MainActivity extends Activity {
     private View buildOutputPanel() {
         LinearLayout panel = panel();
         panel.addView(label("输出"));
+
+        privatePreviewCheck = new CheckBox(this);
+        privatePreviewCheck.setText("私密模式：隐藏当前图片和结果图片");
+        privatePreviewCheck.setChecked(false);
+        privatePreviewCheck.setOnCheckedChangeListener((buttonView, isChecked) -> applyPreviewPrivacy());
+        panel.addView(privatePreviewCheck, lpMatchWrap(0, 6, 0, 8));
 
         outputPreview = new ImageView(this);
         outputPreview.setBackgroundColor(Color.rgb(238, 242, 247));
@@ -401,7 +412,7 @@ public class MainActivity extends Activity {
             return;
         }
         maybeSaveKey(apiKey);
-        runSingleRequest(() -> editImage(apiKey, prompt, selectedImageUri));
+        runSingleEditRequest(apiKey, prompt, selectedImageUri, repeatCount);
     }
 
     private void startBatchEdit() {
@@ -415,7 +426,7 @@ public class MainActivity extends Activity {
             return;
         }
         maybeSaveKey(apiKey);
-        runBatchRequest(apiKey, prompt, selectedFolderUri);
+        runBatchRequest(apiKey, prompt, selectedFolderUri, repeatCount);
     }
 
     private boolean validateCommon(String apiKey, String prompt) {
@@ -460,6 +471,7 @@ public class MainActivity extends Activity {
                 mainHandler.post(() -> {
                     setBusy(false, "完成", false);
                     outputPreview.setImageURI(Uri.fromFile(out));
+                    applyPreviewPrivacy();
                     outputPathView.setText(out.getAbsolutePath());
                     outputInfoView.setText("输出图片：" + describeFile(out));
                     toast("已保存结果");
@@ -473,10 +485,50 @@ public class MainActivity extends Activity {
         });
     }
 
-    private void runBatchRequest(String apiKey, String prompt, Uri folderUri) {
+    private void runSingleEditRequest(String apiKey, String prompt, Uri imageUri, int repeats) {
+        int total = Math.max(1, repeats);
+        setBusy(true, "请求中...", false);
+        executor.execute(() -> {
+            File lastOut = null;
+            try {
+                for (int attempt = 1; attempt <= total; attempt++) {
+                    int currentAttempt = attempt;
+                    mainHandler.post(() -> statusView.setText(
+                            total == 1 ? "请求中..." : "处理中 " + currentAttempt + "/" + total
+                    ));
+                    byte[] result = editImage(apiKey, prompt, imageUri);
+                    lastOut = saveOutput(result, total == 1 ? "" : String.format(Locale.US, "-%02d", attempt));
+                    File displayOut = lastOut;
+                    mainHandler.post(() -> {
+                        outputPreview.setImageURI(Uri.fromFile(displayOut));
+                        applyPreviewPrivacy();
+                        outputPathView.setText(displayOut.getAbsolutePath());
+                        outputInfoView.setText("输出图片：" + describeFile(displayOut));
+                        statusView.setText(total == 1 ? "完成" : "已完成 " + currentAttempt + "/" + total);
+                    });
+                }
+                File finalOut = lastOut;
+                mainHandler.post(() -> {
+                    setBusy(false, total == 1 ? "完成" : "完成：生成 " + total + " 张", false);
+                    if (finalOut != null) {
+                        outputPathView.setText(finalOut.getAbsolutePath());
+                    }
+                    toast(total == 1 ? "已保存结果" : "已保存 " + total + " 张结果");
+                });
+            } catch (Exception e) {
+                mainHandler.post(() -> {
+                    setBusy(false, "失败", false);
+                    toast(safeMessage(e));
+                });
+            }
+        });
+    }
+
+    private void runBatchRequest(String apiKey, String prompt, Uri folderUri, int repeats) {
         setBusy(true, "准备批量处理...", true);
         executor.execute(() -> {
             int success = 0;
+            int totalRepeats = Math.max(1, repeats);
             List<String> failures = new ArrayList<>();
             Uri outputDirUri = null;
             try {
@@ -493,34 +545,43 @@ public class MainActivity extends Activity {
 
                 for (int i = 0; i < images.size(); i++) {
                     BatchImage image = images.get(i);
-                    waitIfPaused(image.name);
-                    int index = i + 1;
-                    mainHandler.post(() -> {
-                        statusView.setText("批量处理中 " + index + "/" + images.size() + ": " + image.name);
-                        currentInfoView.setText("当前处理：" + describeUri(image.uri, image.name, image.size));
-                    });
-                    try {
-                        byte[] result = editImage(apiKey, prompt, image.uri);
-                        String outputName = safeStem(image.name) + "-edited.png";
-                        Uri outUri = saveOutputDocument(outputDirUri, outputName, result);
-                        success++;
+                    for (int repeat = 1; repeat <= totalRepeats; repeat++) {
+                        waitIfPaused(image.name);
+                        int currentRepeat = repeat;
+                        int totalJobs = images.size() * totalRepeats;
+                        int currentJob = i * totalRepeats + repeat;
                         mainHandler.post(() -> {
-                            outputPathView.setText(outUri.toString());
-                            outputInfoView.setText("输出图片：" + describeOutputBytes(outputName, result));
+                            statusView.setText("批量处理中 " + currentJob + "/" + totalJobs
+                                    + ": " + image.name + " 第 " + currentRepeat + "/" + totalRepeats + " 次");
+                            inputPreview.setImageURI(image.uri);
+                            applyPreviewPrivacy();
+                            currentInfoView.setText("当前处理：" + describeUri(image.uri, image.name, image.size));
                         });
-                    } catch (Exception exc) {
-                        failures.add(image.name + " | " + safeMessage(exc));
+                        try {
+                            byte[] result = editImage(apiKey, prompt, image.uri);
+                            String outputName = batchOutputName(image.name, currentRepeat, totalRepeats);
+                            Uri outUri = saveOutputDocument(outputDirUri, outputName, result);
+                            success++;
+                            mainHandler.post(() -> {
+                                outputPathView.setText(outUri.toString());
+                                outputInfoView.setText("输出图片：" + describeOutputBytes(outputName, result));
+                            });
+                        } catch (Exception exc) {
+                            failures.add(image.name + " 第 " + currentRepeat + "/" + totalRepeats
+                                    + " 次 | " + safeMessage(exc));
+                        }
                     }
                 }
 
                 Uri reportUri = null;
                 if (!failures.isEmpty()) {
-                    reportUri = saveFailureReport(outputDirUri, images.size(), success, failures);
+                    reportUri = saveFailureReport(outputDirUri, images.size() * totalRepeats, success, failures);
                 }
                 Uri finalReportUri = reportUri;
                 int finalSuccess = success;
+                int totalJobs = images.size() * totalRepeats;
                 mainHandler.post(() -> {
-                    setBusy(false, "批量完成：成功 " + finalSuccess + " / " + images.size()
+                    setBusy(false, "批量完成：成功 " + finalSuccess + " / " + totalJobs
                             + "，失败 " + failures.size(), false);
                     if (failures.isEmpty()) {
                         toast("批量完成，全部成功");
@@ -985,6 +1046,10 @@ public class MainActivity extends Activity {
     }
 
     private File saveOutput(byte[] bytes) throws Exception {
+        return saveOutput(bytes, "");
+    }
+
+    private File saveOutput(byte[] bytes, String suffix) throws Exception {
         File dir = getExternalFilesDir(Environment.DIRECTORY_PICTURES);
         if (dir == null) {
             dir = getFilesDir();
@@ -992,8 +1057,8 @@ public class MainActivity extends Activity {
         if (!dir.exists() && !dir.mkdirs()) {
             throw new Exception("无法创建输出目录");
         }
-        String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
-        File out = new File(dir, "step-edit-" + stamp + ".png");
+        String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(new Date());
+        File out = new File(dir, "step-edit-" + stamp + suffix + ".png");
         try (FileOutputStream fos = new FileOutputStream(out)) {
             fos.write(bytes);
         }
@@ -1046,6 +1111,17 @@ public class MainActivity extends Activity {
         pauseButton.setText("暂停");
         progressBar.setVisibility(busy ? View.VISIBLE : View.GONE);
         statusView.setText(status);
+    }
+
+    private void applyPreviewPrivacy() {
+        boolean hidden = privatePreviewCheck != null && privatePreviewCheck.isChecked();
+        int visibility = hidden ? View.INVISIBLE : View.VISIBLE;
+        if (inputPreview != null) {
+            inputPreview.setVisibility(visibility);
+        }
+        if (outputPreview != null) {
+            outputPreview.setVisibility(visibility);
+        }
     }
 
     private String describeUri(Uri uri) {
@@ -1203,6 +1279,14 @@ public class MainActivity extends Activity {
             cleaned = cleaned.substring(0, dot);
         }
         return cleaned.isEmpty() ? "image" : cleaned;
+    }
+
+    private String batchOutputName(String sourceName, int repeat, int totalRepeats) {
+        String stem = safeStem(sourceName);
+        if (totalRepeats <= 1) {
+            return stem + "-edited.png";
+        }
+        return stem + "-edited-" + String.format(Locale.US, "%02d", repeat) + ".png";
     }
 
     private String safeMessage(Exception exc) {
