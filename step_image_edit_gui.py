@@ -461,6 +461,7 @@ class StepImageEditApp:
         self.busy = False
         self.pause_event = threading.Event()
         self.pause_event.set()
+        self.stop_event = threading.Event()
 
         self.create_widgets()
 
@@ -614,6 +615,8 @@ class StepImageEditApp:
         self.edit_button.pack(side="right")
         self.pause_button = ttk.Button(action_row, text="暂停", command=self.toggle_pause, state="disabled")
         self.pause_button.pack(side="right", padx=(8, 0))
+        self.stop_button = ttk.Button(action_row, text="停止", command=self.request_stop, state="disabled")
+        self.stop_button.pack(side="right", padx=(8, 0))
 
     def create_generate_tab(self):
         settings = ttk.Frame(self.generate_tab)
@@ -764,6 +767,12 @@ class StepImageEditApp:
             self.pause_event.set()
             self.pause_button.configure(text="暂停")
             self.status.configure(text="继续处理...")
+
+    def request_stop(self):
+        self.stop_event.set()
+        self.pause_event.set()
+        self.pause_button.configure(text="暂停")
+        self.status.configure(text="已请求停止：当前请求结束后停止")
 
     def start_edit(self):
         if self.busy:
@@ -916,10 +925,12 @@ class StepImageEditApp:
     def run_in_thread(self, target, allow_pause=False):
         self.busy = True
         self.pause_event.set()
+        self.stop_event.clear()
         self.status.configure(text="请求中，请稍候...")
         self.edit_button.configure(state="disabled")
         self.batch_button.configure(state="disabled")
         self.pause_button.configure(state="normal" if allow_pause else "disabled", text="暂停")
+        self.stop_button.configure(state="normal" if allow_pause else "disabled")
         self.progress.start(12)
         thread = threading.Thread(target=self.safe_run, args=(target,), daemon=True)
         thread.start()
@@ -980,6 +991,8 @@ class StepImageEditApp:
         repeat = max(1, int(config.get("repeat", 1)))
         results = []
         for index in range(1, repeat + 1):
+            if self.stop_event.is_set():
+                break
             item_config = dict(config)
             if repeat > 1:
                 item_config["output_stem"] = f"{safe_stem(config['image'])}-edited-{index:02d}"
@@ -990,6 +1003,15 @@ class StepImageEditApp:
                     ),
                 )
             results.append(self.edit_image(item_config))
+        if not results:
+            return {
+                "type": "repeat",
+                "success": 0,
+                "total": repeat,
+                "last_result": None,
+                "output_dir": OUTPUT_DIR,
+                "stopped": True,
+            }
         if repeat == 1:
             return results[0]
         return {
@@ -998,6 +1020,7 @@ class StepImageEditApp:
             "total": repeat,
             "last_result": results[-1],
             "output_dir": results[-1].parent,
+            "stopped": self.stop_event.is_set(),
         }
 
     def batch_edit_images(self, config):
@@ -1014,7 +1037,13 @@ class StepImageEditApp:
         )
 
         for index, image in enumerate(images, start=1):
+            skip_remaining_repeats = False
             for repeat_index in range(1, repeat + 1):
+                if self.stop_event.is_set():
+                    log_message("batch stop requested")
+                    break
+                if skip_remaining_repeats:
+                    break
                 if not self.pause_event.is_set():
                     self.root.after(
                         0,
@@ -1054,6 +1083,15 @@ class StepImageEditApp:
                     log_message(
                         f"batch failed: {image.name}; repeat={repeat_index}/{repeat}; {error}"
                     )
+                    if "请求超过" in error or "timed out" in error.lower():
+                        skip_remaining_repeats = True
+                        skipped = repeat - repeat_index
+                        if skipped:
+                            log_message(
+                                f"batch skip remaining repeats: {image.name}; skipped={skipped}"
+                            )
+            if self.stop_event.is_set():
+                break
 
         failure_report = None
         if failures:
@@ -1080,6 +1118,7 @@ class StepImageEditApp:
             "total": total,
             "output_dir": output_dir,
             "failure_report": failure_report,
+            "stopped": self.stop_event.is_set(),
         }
 
     def generate_image(self, config):
@@ -1103,22 +1142,26 @@ class StepImageEditApp:
         self.edit_button.configure(state="normal")
         self.batch_button.configure(state="normal")
         self.pause_button.configure(state="disabled", text="暂停")
+        self.stop_button.configure(state="disabled")
         self.progress.stop()
         if isinstance(result_path, dict) and result_path.get("type") == "batch":
             output_dir = result_path["output_dir"]
             self.output_path.set(str(output_dir))
+            status_prefix = "批量已停止" if result_path.get("stopped") else "批量完成"
             self.status.configure(
-                text=f"批量完成：成功 {result_path['success']} / {result_path['total']}，失败 {result_path['failed']}"
+                text=f"{status_prefix}：成功 {result_path['success']} / {result_path['total']}，失败 {result_path['failed']}"
             )
             if result_path["failed"]:
                 messagebox.showwarning(
-                    "批量处理完成，有失败图片",
+                    f"{status_prefix}，有失败图片",
                     "成功 {success} 张，失败 {failed} 张。\n失败清单：{report}".format(
                         success=result_path["success"],
                         failed=result_path["failed"],
                         report=result_path["failure_report"],
                     ),
                 )
+            elif result_path.get("stopped"):
+                messagebox.showinfo("批量已停止", f"已成功处理 {result_path['success']} 个任务。")
             else:
                 messagebox.showinfo("批量处理完成", f"全部 {result_path['total']} 张图片处理成功。")
             try:
@@ -1129,9 +1172,11 @@ class StepImageEditApp:
 
         if isinstance(result_path, dict) and result_path.get("type") == "repeat":
             last_result = result_path["last_result"]
-            self.output_path.set(str(last_result))
-            self.output_info.set(f"输出图片：{describe_image_file(last_result)}")
-            self.status.configure(text=f"完成：生成 {result_path['success']} 张")
+            if last_result:
+                self.output_path.set(str(last_result))
+                self.output_info.set(f"输出图片：{describe_image_file(last_result)}")
+            prefix = "已停止" if result_path.get("stopped") else "完成"
+            self.status.configure(text=f"{prefix}：生成 {result_path['success']} 张")
             try:
                 os.startfile(result_path["output_dir"])
             except OSError:
@@ -1152,6 +1197,7 @@ class StepImageEditApp:
         self.edit_button.configure(state="normal")
         self.batch_button.configure(state="normal")
         self.pause_button.configure(state="disabled", text="暂停")
+        self.stop_button.configure(state="disabled")
         self.progress.stop()
         self.status.configure(text="失败")
         messagebox.showerror("请求失败", message)
