@@ -457,6 +457,7 @@ class StepImageEditApp:
         self.upload_mode = StringVar(value="智能高质量")
         self.quality_mode = StringVar(value="标准")
         self.timeout_seconds = StringVar(value="300")
+        self.repeat_count = StringVar(value="1")
         self.busy = False
         self.pause_event = threading.Event()
         self.pause_event.set()
@@ -588,6 +589,14 @@ class StepImageEditApp:
             textvariable=self.timeout_seconds,
             values=["75", "120", "180", "300", "600"],
             width=8,
+            state="readonly",
+        ).pack(side="left", padx=8)
+        ttk.Label(settings, text="次数").pack(side="left", padx=(12, 0))
+        ttk.Combobox(
+            settings,
+            textvariable=self.repeat_count,
+            values=["1", "2", "3", "4", "5", "10"],
+            width=6,
             state="readonly",
         ).pack(side="left", padx=8)
 
@@ -801,8 +810,9 @@ class StepImageEditApp:
             "max_side": max_side,
             "steps": steps,
             "timeout": timeout,
+            "repeat": int(self.repeat_count.get()),
         }
-        self.run_in_thread(lambda: self.edit_image(config))
+        self.run_in_thread(lambda: self.repeat_edit_image(config))
 
     def start_batch_edit(self):
         if self.busy:
@@ -847,6 +857,7 @@ class StepImageEditApp:
             "max_side": self.max_side.get(),
             "steps": normalize_quality_mode(self.quality_mode.get()),
             "timeout": int(self.timeout_seconds.get()),
+            "repeat": int(self.repeat_count.get()),
         }
         self.run_in_thread(lambda: self.batch_edit_images(config), allow_pause=True)
 
@@ -965,48 +976,84 @@ class StepImageEditApp:
         )
         return result_path
 
+    def repeat_edit_image(self, config):
+        repeat = max(1, int(config.get("repeat", 1)))
+        results = []
+        for index in range(1, repeat + 1):
+            item_config = dict(config)
+            if repeat > 1:
+                item_config["output_stem"] = f"{safe_stem(config['image'])}-edited-{index:02d}"
+                self.root.after(
+                    0,
+                    lambda i=index, total=repeat: self.status.configure(
+                        text=f"处理中 {i}/{total}"
+                    ),
+                )
+            results.append(self.edit_image(item_config))
+        if repeat == 1:
+            return results[0]
+        return {
+            "type": "repeat",
+            "success": len(results),
+            "total": repeat,
+            "last_result": results[-1],
+            "output_dir": results[-1].parent,
+        }
+
     def batch_edit_images(self, config):
         images = config["images"]
         output_dir = Path(config["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
         failures = []
         successes = []
-        total = len(images)
+        repeat = max(1, int(config.get("repeat", 1)))
+        total = len(images) * repeat
         log_message(
-            f"batch start: total={total}; output={output_dir}; "
+            f"batch start: images={len(images)}; repeat={repeat}; total={total}; output={output_dir}; "
             f"mode={config['upload_mode']}; max_side={config['max_side']}; steps={config['steps']}"
         )
 
         for index, image in enumerate(images, start=1):
-            if not self.pause_event.is_set():
+            for repeat_index in range(1, repeat + 1):
+                if not self.pause_event.is_set():
+                    self.root.after(
+                        0,
+                        lambda name=image.name: self.status.configure(
+                            text=f"已暂停，下一张待处理：{name}"
+                        ),
+                    )
+                while not self.pause_event.is_set():
+                    time.sleep(0.2)
+
+                job_index = (index - 1) * repeat + repeat_index
                 self.root.after(
                     0,
-                    lambda name=image.name: self.status.configure(
-                        text=f"已暂停，下一张待处理：{name}"
+                    lambda job=job_index, total=total, img=image, r=repeat_index, repeats=repeat: (
+                        self.status.configure(
+                            text=f"批量处理中 {job}/{total}: {img.name} 第 {r}/{repeats} 次"
+                        ),
+                        self.current_info.set(f"当前处理：{describe_image_file(img)}"),
                     ),
                 )
-            while not self.pause_event.is_set():
-                time.sleep(0.2)
-
-            self.root.after(
-                0,
-                lambda i=index, total=total, img=image: (
-                    self.status.configure(text=f"批量处理中 {i}/{total}: {img.name}"),
-                    self.current_info.set(f"当前处理：{describe_image_file(img)}"),
-                ),
-            )
-            item_config = dict(config)
-            item_config["image"] = str(image)
-            item_config["mask"] = ""
-            item_config["output_stem"] = f"{safe_stem(image)}-edited"
-            try:
-                result = self.edit_image(item_config)
-                successes.append(result)
-                log_message(f"batch success: {image.name} -> {result}")
-            except Exception as exc:
-                error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-                failures.append((str(image), error))
-                log_message(f"batch failed: {image.name}; {error}")
+                item_config = dict(config)
+                item_config["image"] = str(image)
+                item_config["mask"] = ""
+                if repeat > 1:
+                    item_config["output_stem"] = f"{safe_stem(image)}-edited-{repeat_index:02d}"
+                else:
+                    item_config["output_stem"] = f"{safe_stem(image)}-edited"
+                try:
+                    result = self.edit_image(item_config)
+                    successes.append(result)
+                    log_message(
+                        f"batch success: {image.name} repeat={repeat_index}/{repeat} -> {result}"
+                    )
+                except Exception as exc:
+                    error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+                    failures.append((str(image), repeat_index, repeat, error))
+                    log_message(
+                        f"batch failed: {image.name}; repeat={repeat_index}/{repeat}; {error}"
+                    )
 
         failure_report = None
         if failures:
@@ -1019,8 +1066,9 @@ class StepImageEditApp:
                 f"失败: {len(failures)}",
                 "",
             ]
-            for image, error in failures:
+            for image, repeat_index, repeat_total, error in failures:
                 lines.append(image)
+                lines.append(f"第 {repeat_index}/{repeat_total} 次")
                 lines.append(error)
                 lines.append("")
             failure_report.write_text("\n".join(lines), encoding="utf-8")
@@ -1075,6 +1123,17 @@ class StepImageEditApp:
                 messagebox.showinfo("批量处理完成", f"全部 {result_path['total']} 张图片处理成功。")
             try:
                 os.startfile(output_dir)
+            except OSError:
+                pass
+            return
+
+        if isinstance(result_path, dict) and result_path.get("type") == "repeat":
+            last_result = result_path["last_result"]
+            self.output_path.set(str(last_result))
+            self.output_info.set(f"输出图片：{describe_image_file(last_result)}")
+            self.status.configure(text=f"完成：生成 {result_path['success']} 张")
+            try:
+                os.startfile(result_path["output_dir"])
             except OSError:
                 pass
             return
