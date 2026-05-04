@@ -30,6 +30,17 @@ RESIZE_SCRIPT = APP_DIR / "resize_image.ps1"
 REQUEST_TIMEOUT = 75
 REQUEST_HARD_TIMEOUT_GRACE = 10
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+DIMENSION_ALIGNMENT = 16
+RATIO_MATCH_TOLERANCE = 0.025
+COMMON_RATIOS = (
+    ("9:16", 9, 16),
+    ("2:3", 2, 3),
+    ("3:4", 3, 4),
+    ("1:1", 1, 1),
+    ("4:3", 4, 3),
+    ("3:2", 3, 2),
+    ("16:9", 16, 9),
+)
 
 
 def log_message(message):
@@ -118,6 +129,73 @@ def safe_stem(path):
     stem = Path(path).stem.strip()
     cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in stem)
     return cleaned or "image"
+
+
+def align_up(value, alignment=DIMENSION_ALIGNMENT):
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def ceil_div(value, divisor):
+    return (value + divisor - 1) // divisor
+
+
+def is_aligned(value):
+    return value > 0 and value % DIMENSION_ALIGNMENT == 0
+
+
+def nearest_common_ratio(width, height):
+    source_ratio = width / height
+    best = None
+    best_diff = None
+    for label, ratio_width, ratio_height in COMMON_RATIOS:
+        value = ratio_width / ratio_height
+        diff = abs(source_ratio - value) / value
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            best = (label, ratio_width, ratio_height)
+    if best_diff is not None and best_diff <= RATIO_MATCH_TOLERANCE:
+        return best
+    return None
+
+
+def choose_normalized_size(width, height, max_side):
+    ratio = nearest_common_ratio(width, height)
+    if ratio:
+        label, ratio_width, ratio_height = ratio
+        unit = max(ceil_div(width, ratio_width), ceil_div(height, ratio_height))
+        unit = align_up(unit)
+        target_width = ratio_width * unit
+        target_height = ratio_height * unit
+        if target_width <= max_side and target_height <= max_side:
+            summary = f"自动识别 {label}，补边到 16 倍数"
+        else:
+            target_width = 0
+            target_height = 0
+            summary = "自动补边到 16 倍数"
+    else:
+        target_width = 0
+        target_height = 0
+        summary = "自动补边到 16 倍数"
+
+    if target_width <= 0 or target_height <= 0:
+        target_width = min(max_side, align_up(width))
+        target_height = min(max_side, align_up(height))
+
+    offset_x = max(0, (target_width - width) // 2)
+    offset_y = max(0, (target_height - height) // 2)
+    needs_padding = target_width != width or target_height != height
+    if not needs_padding:
+        summary = "尺寸已稳定"
+    return {
+        "target_width": target_width,
+        "target_height": target_height,
+        "content_width": width,
+        "content_height": height,
+        "offset_x": offset_x,
+        "offset_y": offset_y,
+        "needs_padding": needs_padding,
+        "summary": summary,
+    }
 
 
 def get_image_dimensions(path):
@@ -223,12 +301,12 @@ def prepare_upload_image(path, upload_mode, max_side):
     image_path = Path(path)
     if upload_mode == "original":
         log_message(f"upload original: {image_path.name} ({image_path.stat().st_size / 1024 / 1024:.2f}MB)")
-        return str(image_path)
+        return str(image_path), None
 
     suffix = image_path.suffix.lower()
     if suffix not in {".jpg", ".jpeg", ".png", ".bmp"}:
         log_message(f"skip resize for unsupported format: {image_path.name}")
-        return str(image_path)
+        return str(image_path), None
 
     try:
         max_side = int(max_side)
@@ -239,14 +317,73 @@ def prepare_upload_image(path, upload_mode, max_side):
     if upload_mode == "smart":
         if not dimensions:
             log_message(f"smart upload original, dimension unknown: {image_path.name}")
-            return str(image_path)
+            return str(image_path), None
         width, height = dimensions
-        if max(width, height) <= max_side:
+        if max(width, height) <= max_side and is_aligned(width) and is_aligned(height):
             log_message(
                 f"smart upload original: {image_path.name} "
                 f"({width}x{height}, {image_path.stat().st_size / 1024 / 1024:.2f}MB)"
             )
-            return str(image_path)
+            return str(image_path), None
+
+        scale = min(1.0, max_side / max(width, height))
+        content_width = max(1, round(width * scale))
+        content_height = max(1, round(height * scale))
+        normalized = choose_normalized_size(content_width, content_height, max_side)
+        if normalized["needs_padding"]:
+            cache_dir = OUTPUT_DIR / "upload-cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            out_path = cache_dir / (
+                f"{safe_stem(image_path)}-pad-"
+                f"{normalized['target_width']}x{normalized['target_height']}.png"
+            )
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(RESIZE_SCRIPT),
+                "-InputPath",
+                str(image_path),
+                "-OutputPath",
+                str(out_path),
+                "-MaxSide",
+                str(max_side),
+                "-Format",
+                "png",
+                "-Mode",
+                "pad",
+                "-TargetWidth",
+                str(normalized["target_width"]),
+                "-TargetHeight",
+                str(normalized["target_height"]),
+                "-ContentWidth",
+                str(content_width),
+                "-ContentHeight",
+                str(content_height),
+                "-OffsetX",
+                str(normalized["offset_x"]),
+                "-OffsetY",
+                str(normalized["offset_y"]),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if proc.returncode == 0 and out_path.exists():
+                summary = proc.stdout.strip()
+                log_message(
+                    "smart upload normalized: "
+                    f"{image_path.name} {width}x{height} -> "
+                    f"{normalized['target_width']}x{normalized['target_height']}; "
+                    f"crop back {content_width}x{content_height}; {normalized['summary']}; {summary}"
+                )
+                return str(out_path), {
+                    "content_width": content_width,
+                    "content_height": content_height,
+                    "offset_x": normalized["offset_x"],
+                    "offset_y": normalized["offset_y"],
+                }
+            log_message(f"pad preprocess failed: {proc.stderr.strip() or proc.stdout.strip()}")
+
         upload_mode = "png" if suffix == ".png" else "jpg95"
 
     cache_dir = OUTPUT_DIR / "upload-cache"
@@ -285,8 +422,8 @@ def prepare_upload_image(path, upload_mode, max_side):
     summary = proc.stdout.strip()
     log_message(f"upload preprocess summary: mode={upload_mode}; {summary}")
     if out_path.exists():
-        return str(out_path)
-    return str(image_path)
+        return str(out_path), None
+    return str(image_path), None
 
 
 def build_multipart(fields, files):
@@ -529,6 +666,67 @@ def save_result(response, prefix, timeout, output_dir=None, output_stem=None):
         return out
 
     raise RuntimeError("API response did not include b64_json or url.")
+
+
+def crop_result_file(path, crop_info):
+    if not crop_info:
+        return Path(path)
+    source_path = Path(path)
+    dimensions = get_image_dimensions(source_path)
+    content_width = int(crop_info["content_width"])
+    content_height = int(crop_info["content_height"])
+    offset_x = int(crop_info["offset_x"])
+    offset_y = int(crop_info["offset_y"])
+    if dimensions == (content_width, content_height):
+        return source_path
+    if dimensions:
+        width, height = dimensions
+        if width < offset_x + content_width or height < offset_y + content_height:
+            log_message(
+                f"skip crop: result too small {source_path.name} "
+                f"{width}x{height}, need {offset_x + content_width}x{offset_y + content_height}"
+            )
+            return source_path
+
+    out_path = unique_path(source_path.with_name(f"{source_path.stem}-cropped.png"))
+    cmd = [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(RESIZE_SCRIPT),
+        "-InputPath",
+        str(source_path),
+        "-OutputPath",
+        str(out_path),
+        "-Format",
+        "png",
+        "-Mode",
+        "crop",
+        "-ContentWidth",
+        str(content_width),
+        "-ContentHeight",
+        str(content_height),
+        "-OffsetX",
+        str(offset_x),
+        "-OffsetY",
+        str(offset_y),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        log_message(f"crop failed: {proc.stderr.strip() or proc.stdout.strip()}")
+        return source_path
+    if out_path.exists():
+        try:
+            source_path.unlink()
+            out_path.rename(source_path)
+            log_message(f"crop result: {source_path.name}; {proc.stdout.strip()}")
+            return source_path
+        except OSError as exc:
+            log_message(f"crop rename failed: {exc}")
+            return out_path
+    return source_path
 
 
 class StepImageEditApp:
@@ -1066,11 +1264,22 @@ class StepImageEditApp:
         if config.get("is_test"):
             fields["seed"] = "1"
         files = {"image": config["image"]}
-        files["image"] = prepare_upload_image(
+        upload_path, crop_info = prepare_upload_image(
             config["image"],
             config.get("upload_mode", "original"),
             config.get("max_side", "1536"),
         )
+        files["image"] = upload_path
+        if crop_info:
+            self.root.after(
+                0,
+                lambda info=crop_info, path=upload_path: self.current_info.set(
+                    "当前处理："
+                    f"{describe_image_file(image_path)}\n"
+                    f"上传适配：{describe_image_file(path)}，返回后裁回 "
+                    f"{info['content_width']}x{info['content_height']}"
+                ),
+            )
         if config["mask"]:
             files["mask"] = config["mask"]
 
@@ -1088,6 +1297,7 @@ class StepImageEditApp:
             output_dir=config.get("output_dir"),
             output_stem=config.get("output_stem"),
         )
+        result_path = crop_result_file(result_path, crop_info)
         self.root.after(
             0,
             lambda p=result_path: self.output_info.set(f"输出图片：{describe_image_file(p)}"),

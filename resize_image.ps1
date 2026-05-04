@@ -3,7 +3,14 @@ param(
   [Parameter(Mandatory=$true)][string]$OutputPath,
   [int]$MaxSide = 1536,
   [int]$Quality = 95,
-  [ValidateSet("jpg", "png")][string]$Format = "jpg"
+  [ValidateSet("jpg", "png")][string]$Format = "jpg",
+  [ValidateSet("resize", "pad", "crop")][string]$Mode = "resize",
+  [int]$TargetWidth = 0,
+  [int]$TargetHeight = 0,
+  [int]$ContentWidth = 0,
+  [int]$ContentHeight = 0,
+  [int]$OffsetX = 0,
+  [int]$OffsetY = 0
 )
 
 Add-Type -AssemblyName System.Drawing
@@ -19,9 +26,28 @@ $image = [System.Drawing.Image]::FromFile($inputFullPath)
 try {
   $inputWidth = $image.Width
   $inputHeight = $image.Height
-  $scale = [Math]::Min(1.0, $MaxSide / [double]([Math]::Max($inputWidth, $inputHeight)))
-  $outputWidth = [Math]::Max(1, [int][Math]::Round($inputWidth * $scale))
-  $outputHeight = [Math]::Max(1, [int][Math]::Round($inputHeight * $scale))
+  if ($Mode -eq "crop") {
+    if ($ContentWidth -le 0) { $ContentWidth = $inputWidth - $OffsetX }
+    if ($ContentHeight -le 0) { $ContentHeight = $inputHeight - $OffsetY }
+    if ($OffsetX -lt 0 -or $OffsetY -lt 0 -or
+        $OffsetX + $ContentWidth -gt $inputWidth -or
+        $OffsetY + $ContentHeight -gt $inputHeight) {
+      throw "Invalid crop rectangle."
+    }
+    $outputWidth = $ContentWidth
+    $outputHeight = $ContentHeight
+  } elseif ($Mode -eq "pad") {
+    if ($ContentWidth -le 0) { $ContentWidth = $inputWidth }
+    if ($ContentHeight -le 0) { $ContentHeight = $inputHeight }
+    if ($TargetWidth -le 0) { $TargetWidth = $ContentWidth }
+    if ($TargetHeight -le 0) { $TargetHeight = $ContentHeight }
+    $outputWidth = $TargetWidth
+    $outputHeight = $TargetHeight
+  } else {
+    $scale = [Math]::Min(1.0, $MaxSide / [double]([Math]::Max($inputWidth, $inputHeight)))
+    $outputWidth = [Math]::Max(1, [int][Math]::Round($inputWidth * $scale))
+    $outputHeight = [Math]::Max(1, [int][Math]::Round($inputHeight * $scale))
+  }
 
   $bitmap = New-Object System.Drawing.Bitmap($outputWidth, $outputHeight)
   try {
@@ -30,12 +56,28 @@ try {
       $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
       $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
       $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
-      if ($Format -eq "png") {
+      if ($Mode -eq "pad") {
+        $sourceBitmap = New-Object System.Drawing.Bitmap($image)
+        try {
+          $background = $sourceBitmap.GetPixel(0, 0)
+        } finally {
+          $sourceBitmap.Dispose()
+        }
+        $graphics.Clear($background)
+        $graphics.DrawImage($image, $OffsetX, $OffsetY, $ContentWidth, $ContentHeight)
+      } elseif ($Mode -eq "crop") {
         $graphics.Clear([System.Drawing.Color]::Transparent)
+        $srcRect = New-Object System.Drawing.Rectangle($OffsetX, $OffsetY, $ContentWidth, $ContentHeight)
+        $dstRect = New-Object System.Drawing.Rectangle(0, 0, $ContentWidth, $ContentHeight)
+        $graphics.DrawImage($image, $dstRect, $srcRect, [System.Drawing.GraphicsUnit]::Pixel)
       } else {
-        $graphics.Clear([System.Drawing.Color]::White)
+        if ($Format -eq "png") {
+          $graphics.Clear([System.Drawing.Color]::Transparent)
+        } else {
+          $graphics.Clear([System.Drawing.Color]::White)
+        }
+        $graphics.DrawImage($image, 0, 0, $outputWidth, $outputHeight)
       }
-      $graphics.DrawImage($image, 0, 0, $outputWidth, $outputHeight)
     } finally {
       $graphics.Dispose()
     }
@@ -65,7 +107,12 @@ $outFile = Get-Item -LiteralPath $outputFullPath
   inputHeight = $inputHeight
   outputWidth = $outputWidth
   outputHeight = $outputHeight
+  offsetX = $OffsetX
+  offsetY = $OffsetY
+  contentWidth = $ContentWidth
+  contentHeight = $ContentHeight
   outputBytes = $outFile.Length
   format = $Format
   quality = $Quality
+  mode = $Mode
 } | ConvertTo-Json -Compress
