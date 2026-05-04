@@ -97,6 +97,12 @@ def normalize_quality_mode(label):
     return "8"
 
 
+def normalize_network_mode(label):
+    if label == "系统代理":
+        return "system"
+    return "direct"
+
+
 def guess_mime(path):
     guessed, _ = mimetypes.guess_type(path)
     return guessed or "application/octet-stream"
@@ -417,7 +423,7 @@ def prepare_upload_image(path, upload_mode, max_side):
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if proc.returncode != 0:
         log_message(f"resize failed: {proc.stderr.strip() or proc.stdout.strip()}")
-        return str(image_path)
+        return str(image_path), None
 
     summary = proc.stdout.strip()
     log_message(f"upload preprocess summary: mode={upload_mode}; {summary}")
@@ -463,7 +469,7 @@ def build_multipart(fields, files):
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
-def _urlopen_worker(url, data, method, headers, timeout, result_queue):
+def _urlopen_worker(url, data, method, headers, timeout, network_mode, result_queue):
     try:
         req = urllib.request.Request(
             url,
@@ -471,7 +477,11 @@ def _urlopen_worker(url, data, method, headers, timeout, result_queue):
             method=method,
             headers=headers,
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if network_mode == "direct":
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        else:
+            opener = urllib.request.build_opener()
+        with opener.open(req, timeout=timeout) as resp:
             raw = resp.read()
             result_queue.put(
                 {
@@ -517,7 +527,7 @@ def _urlopen_worker(url, data, method, headers, timeout, result_queue):
         )
 
 
-def request_json(url, api_key, payload, timeout):
+def request_json(url, api_key, payload, timeout, network_mode="direct"):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -528,10 +538,10 @@ def request_json(url, api_key, payload, timeout):
             "Content-Type": "application/json",
         },
     )
-    return send_request(req, timeout)
+    return send_request(req, timeout, network_mode)
 
 
-def request_multipart(url, api_key, fields, files, timeout):
+def request_multipart(url, api_key, fields, files, timeout, network_mode="direct"):
     body, content_type = build_multipart(fields, files)
     file_summary = ", ".join(
         f"{field}={Path(path).name}({Path(path).stat().st_size / 1024 / 1024:.2f}MB)"
@@ -552,12 +562,13 @@ def request_multipart(url, api_key, fields, files, timeout):
             "Content-Type": content_type,
         },
     )
-    return send_request(req, timeout)
+    return send_request(req, timeout, network_mode)
 
 
-def send_request(req, timeout):
+def send_request(req, timeout, network_mode="direct"):
     proxies = urllib.request.getproxies()
-    log_message(f"POST {req.full_url}; proxies={proxies}")
+    proxy_text = "disabled" if network_mode == "direct" else str(proxies)
+    log_message(f"POST {req.full_url}; network={network_mode}; proxies={proxy_text}")
 
     result_queue = multiprocessing.Queue(maxsize=1)
     process = multiprocessing.Process(
@@ -568,6 +579,7 @@ def send_request(req, timeout):
             req.get_method(),
             dict(req.header_items()),
             timeout,
+            network_mode,
             result_queue,
         ),
         daemon=True,
@@ -623,7 +635,7 @@ def send_request(req, timeout):
     return json.loads(raw.decode("utf-8"))
 
 
-def save_result(response, prefix, timeout, output_dir=None, output_stem=None):
+def save_result(response, prefix, timeout, output_dir=None, output_stem=None, network_mode="direct"):
     target_dir = Path(output_dir) if output_dir else OUTPUT_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -653,7 +665,11 @@ def save_result(response, prefix, timeout, output_dir=None, output_stem=None):
 
     if item.get("url"):
         image_url = item["url"]
-        with urllib.request.urlopen(image_url, timeout=timeout) as resp:
+        if network_mode == "direct":
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        else:
+            opener = urllib.request.build_opener()
+        with opener.open(image_url, timeout=timeout) as resp:
             image_bytes = resp.read()
             content_type = resp.headers.get("Content-Type", "")
         suffix = ".png"
@@ -756,6 +772,7 @@ class StepImageEditApp:
         self.quality_mode = StringVar(value="标准")
         self.timeout_seconds = StringVar(value="300")
         self.repeat_count = StringVar(value="1")
+        self.network_mode = StringVar(value="直连")
         self.busy = False
         self.pause_event = threading.Event()
         self.pause_event.set()
@@ -897,6 +914,14 @@ class StepImageEditApp:
             textvariable=self.repeat_count,
             values=["1", "2", "3", "4", "5", "10"],
             width=6,
+            state="readonly",
+        ).pack(side="left", padx=8)
+        ttk.Label(settings, text="网络").pack(side="left", padx=(12, 0))
+        ttk.Combobox(
+            settings,
+            textvariable=self.network_mode,
+            values=["直连", "系统代理"],
+            width=10,
             state="readonly",
         ).pack(side="left", padx=8)
 
@@ -1092,6 +1117,7 @@ class StepImageEditApp:
         upload_mode = normalize_upload_mode(self.upload_mode.get()) if auto_resize else "original"
         steps = normalize_quality_mode(self.quality_mode.get())
         timeout = int(self.timeout_seconds.get())
+        network_mode = normalize_network_mode(self.network_mode.get())
         if not image:
             messagebox.showwarning("缺少原图", "请先选择要编辑的图片。")
             return
@@ -1119,6 +1145,7 @@ class StepImageEditApp:
             "steps": steps,
             "timeout": timeout,
             "repeat": int(self.repeat_count.get()),
+            "network_mode": network_mode,
         }
         self.run_in_thread(lambda: self.repeat_edit_image(config))
 
@@ -1154,6 +1181,7 @@ class StepImageEditApp:
             return
 
         upload_mode = normalize_upload_mode(self.upload_mode.get()) if self.auto_resize.get() else "original"
+        network_mode = normalize_network_mode(self.network_mode.get())
         output_dir = folder_path / "stepfun_outputs"
         config = {
             "api_key": key,
@@ -1166,6 +1194,7 @@ class StepImageEditApp:
             "steps": normalize_quality_mode(self.quality_mode.get()),
             "timeout": int(self.timeout_seconds.get()),
             "repeat": int(self.repeat_count.get()),
+            "network_mode": network_mode,
         }
         self.run_in_thread(lambda: self.batch_edit_images(config), allow_pause=True)
 
@@ -1193,6 +1222,7 @@ class StepImageEditApp:
             "size": size,
             "response_format": response_format,
             "timeout": int(self.timeout_seconds.get()),
+            "network_mode": normalize_network_mode(self.network_mode.get()),
         }
         self.run_in_thread(lambda: self.generate_image(config))
 
@@ -1223,6 +1253,7 @@ class StepImageEditApp:
             "steps": "8",
             "timeout": min(int(self.timeout_seconds.get()), 75),
             "is_test": True,
+            "network_mode": normalize_network_mode(self.network_mode.get()),
         }
         self.run_in_thread(lambda: self.edit_image(config), status_text="API 测试中，最多等待 75 秒...")
 
@@ -1289,6 +1320,7 @@ class StepImageEditApp:
             fields,
             files,
             config.get("timeout", REQUEST_TIMEOUT),
+            config.get("network_mode", "direct"),
         )
         result_path = save_result(
             response,
@@ -1296,6 +1328,7 @@ class StepImageEditApp:
             config.get("timeout", REQUEST_TIMEOUT),
             output_dir=config.get("output_dir"),
             output_stem=config.get("output_stem"),
+            network_mode=config.get("network_mode", "direct"),
         )
         result_path = crop_result_file(result_path, crop_info)
         self.root.after(
@@ -1450,8 +1483,14 @@ class StepImageEditApp:
             config["api_key"],
             payload,
             config.get("timeout", REQUEST_TIMEOUT),
+            config.get("network_mode", "direct"),
         )
-        return save_result(response, "generate", config.get("timeout", REQUEST_TIMEOUT))
+        return save_result(
+            response,
+            "generate",
+            config.get("timeout", REQUEST_TIMEOUT),
+            network_mode=config.get("network_mode", "direct"),
+        )
 
     def finish_success(self, result_path):
         self.busy = False
