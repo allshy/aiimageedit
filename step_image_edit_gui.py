@@ -1,7 +1,9 @@
 import base64
 import json
 import mimetypes
+import multiprocessing
 import os
+import queue
 import subprocess
 import threading
 import time
@@ -26,6 +28,7 @@ LOG_FILE = APP_DIR / "step_image_edit_gui.log"
 ENV_FILE = APP_DIR / ".env"
 RESIZE_SCRIPT = APP_DIR / "resize_image.ps1"
 REQUEST_TIMEOUT = 75
+REQUEST_HARD_TIMEOUT_GRACE = 10
 SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
@@ -323,6 +326,60 @@ def build_multipart(fields, files):
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
+def _urlopen_worker(url, data, method, headers, timeout, result_queue):
+    try:
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers=headers,
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            result_queue.put(
+                {
+                    "ok": True,
+                    "status": resp.status,
+                    "content_type": resp.headers.get("Content-Type", ""),
+                    "raw": raw,
+                }
+            )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        result_queue.put(
+            {
+                "ok": False,
+                "kind": "http",
+                "code": exc.code,
+                "detail": detail,
+            }
+        )
+    except urllib.error.URLError as exc:
+        result_queue.put(
+            {
+                "ok": False,
+                "kind": "network",
+                "detail": str(exc),
+            }
+        )
+    except TimeoutError:
+        result_queue.put(
+            {
+                "ok": False,
+                "kind": "timeout",
+                "detail": f"请求超过 {timeout} 秒仍未返回，已自动停止。",
+            }
+        )
+    except Exception as exc:
+        result_queue.put(
+            {
+                "ok": False,
+                "kind": "unexpected",
+                "detail": "".join(traceback.format_exception_only(type(exc), exc)).strip(),
+            }
+        )
+
+
 def request_json(url, api_key, payload, timeout):
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -362,23 +419,66 @@ def request_multipart(url, api_key, fields, files, timeout):
 
 
 def send_request(req, timeout):
-    try:
-        proxies = urllib.request.getproxies()
-        log_message(f"POST {req.full_url}; proxies={proxies}")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            content_type = resp.headers.get("Content-Type", "")
-            log_message(f"response status={resp.status}; content_type={content_type}; bytes={len(raw)}")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        log_message(f"HTTP {exc.code}: {detail}")
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        log_message(f"Network error: {exc}")
-        raise RuntimeError(f"网络请求失败或超时：{exc}") from exc
-    except TimeoutError as exc:
-        log_message("Request timed out")
-        raise RuntimeError(f"请求超过 {timeout} 秒仍未返回，已自动停止。") from exc
+    proxies = urllib.request.getproxies()
+    log_message(f"POST {req.full_url}; proxies={proxies}")
+
+    result_queue = multiprocessing.Queue(maxsize=1)
+    process = multiprocessing.Process(
+        target=_urlopen_worker,
+        args=(
+            req.full_url,
+            req.data,
+            req.get_method(),
+            dict(req.header_items()),
+            timeout,
+            result_queue,
+        ),
+        daemon=True,
+    )
+    process.start()
+
+    deadline = time.monotonic() + timeout + REQUEST_HARD_TIMEOUT_GRACE
+    result = None
+    while time.monotonic() < deadline:
+        try:
+            result = result_queue.get(timeout=0.2)
+            break
+        except queue.Empty:
+            if not process.is_alive():
+                break
+
+    if result is None:
+        if process.is_alive():
+            process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
+        log_message(f"Request hard timed out after {timeout} seconds")
+        raise RuntimeError(f"请求超过 {timeout} 秒仍未返回，已强制停止本次请求。")
+
+    process.join(2)
+
+    if not result.get("ok"):
+        kind = result.get("kind")
+        if kind == "http":
+            detail = result.get("detail", "")
+            code = result.get("code", "")
+            log_message(f"HTTP {code}: {detail}")
+            raise RuntimeError(f"HTTP {code}: {detail}")
+        if kind == "timeout":
+            detail = result.get("detail", f"请求超过 {timeout} 秒仍未返回，已自动停止。")
+            log_message("Request timed out")
+            raise RuntimeError(detail)
+        detail = result.get("detail", "未知网络错误")
+        log_message(f"Network error: {detail}")
+        raise RuntimeError(f"网络请求失败或超时：{detail}")
+
+    raw = result["raw"]
+    content_type = result.get("content_type", "")
+    log_message(
+        f"response status={result.get('status')}; content_type={content_type}; bytes={len(raw)}"
+    )
 
     if "application/json" not in content_type:
         return {"raw_bytes": raw, "content_type": content_type}
@@ -498,7 +598,8 @@ class StepImageEditApp:
         ttk.Button(api_frame, text="清除", command=self.clear_key_clicked).grid(
             row=0, column=4, padx=4, pady=10
         )
-        ttk.Button(api_frame, text="测试 API", command=self.start_api_test).grid(
+        self.test_button = ttk.Button(api_frame, text="测试 API", command=self.start_api_test)
+        self.test_button.grid(
             row=0, column=5, sticky="e", padx=10, pady=10
         )
         ttk.Label(api_frame, textvariable=self.key_status, style="Hint.TLabel").grid(
@@ -899,6 +1000,11 @@ class StepImageEditApp:
 
     def start_api_test(self):
         if self.busy:
+            self.status.configure(text="当前仍有任务在处理中，不能同时测试 API。")
+            messagebox.showinfo(
+                "正在处理",
+                "当前还有图片请求没有结束。请先等待当前请求超时返回，或在批量任务中点击“停止”。",
+            )
             return
         try:
             key = self.get_api_key()
@@ -917,18 +1023,19 @@ class StepImageEditApp:
             "response_format": "b64_json",
             "upload_mode": "original",
             "steps": "8",
-            "timeout": int(self.timeout_seconds.get()),
+            "timeout": min(int(self.timeout_seconds.get()), 75),
             "is_test": True,
         }
-        self.run_in_thread(lambda: self.edit_image(config))
+        self.run_in_thread(lambda: self.edit_image(config), status_text="API 测试中，最多等待 75 秒...")
 
-    def run_in_thread(self, target, allow_pause=False):
+    def run_in_thread(self, target, allow_pause=False, status_text="请求中，请稍候..."):
         self.busy = True
         self.pause_event.set()
         self.stop_event.clear()
-        self.status.configure(text="请求中，请稍候...")
+        self.status.configure(text=status_text)
         self.edit_button.configure(state="disabled")
         self.batch_button.configure(state="disabled")
+        self.test_button.configure(state="disabled")
         self.pause_button.configure(state="normal" if allow_pause else "disabled", text="暂停")
         self.stop_button.configure(state="normal" if allow_pause else "disabled")
         self.progress.start(12)
@@ -1141,6 +1248,7 @@ class StepImageEditApp:
         self.pause_event.set()
         self.edit_button.configure(state="normal")
         self.batch_button.configure(state="normal")
+        self.test_button.configure(state="normal")
         self.pause_button.configure(state="disabled", text="暂停")
         self.stop_button.configure(state="disabled")
         self.progress.stop()
@@ -1196,6 +1304,7 @@ class StepImageEditApp:
         self.pause_event.set()
         self.edit_button.configure(state="normal")
         self.batch_button.configure(state="normal")
+        self.test_button.configure(state="normal")
         self.pause_button.configure(state="disabled", text="暂停")
         self.stop_button.configure(state="disabled")
         self.progress.stop()
@@ -1231,4 +1340,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
