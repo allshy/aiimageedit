@@ -80,8 +80,11 @@ public class MainActivity extends Activity {
 
     private EditText apiKeyInput;
     private EditText promptInput;
+    private EditText negativePromptInput;
+    private EditText seedInput;
     private CheckBox rememberKeyCheck;
     private CheckBox privatePreviewCheck;
+    private CheckBox textModeCheck;
     private TextView keyStatusView;
     private TextView imageInfoView;
     private TextView folderInfoView;
@@ -100,6 +103,8 @@ public class MainActivity extends Activity {
     private Uri selectedFolderUri;
     private String uploadMode = "smart";
     private int maxSide = 4096;
+    private String steps = "8";
+    private String cfgScale = "1.0";
     private int timeoutSeconds = 300;
     private int repeatCount = 1;
     private volatile boolean pauseRequested = false;
@@ -286,6 +291,13 @@ public class MainActivity extends Activity {
         promptInput.setText("把背景换成干净的白色摄影棚，保持主体不变");
         promptInput.setBackgroundResource(getResources().getIdentifier("edit_text_bg", "drawable", getPackageName()));
         panel.addView(promptInput, lpMatchWrap(0, 6, 0, 0));
+
+        panel.addView(label("负面提示词"), lpMatchWrap(0, 10, 0, 0));
+        negativePromptInput = new EditText(this);
+        negativePromptInput.setMinLines(2);
+        negativePromptInput.setGravity(Gravity.TOP | Gravity.START);
+        negativePromptInput.setBackgroundResource(getResources().getIdentifier("edit_text_bg", "drawable", getPackageName()));
+        panel.addView(negativePromptInput, lpMatchWrap(0, 6, 0, 0));
         return panel;
     }
 
@@ -293,12 +305,13 @@ public class MainActivity extends Activity {
         LinearLayout panel = panel();
         panel.addView(label("上传与超时"));
 
-        panel.addView(hint("智能高质量会自动识别比例，并用补边适配模型稳定尺寸；完成后裁回原尺寸。"));
-        panel.addView(spinnerRow("上传模式", new String[]{"智能高质量", "高质JPG", "无损PNG", "原图"}, 0,
+        panel.addView(hint("原图优先会在 4096 内直接上传；兼容补边用于接口不稳定时再适配 16 倍数。"));
+        panel.addView(spinnerRow("上传模式", new String[]{"原图优先", "兼容补边", "高质JPG", "无损PNG", "原图"}, 0,
                 (parent, position) -> {
-                    if (position == 1) uploadMode = "jpg95";
-                    else if (position == 2) uploadMode = "png";
-                    else if (position == 3) uploadMode = "original";
+                    if (position == 1) uploadMode = "compatible";
+                    else if (position == 2) uploadMode = "jpg95";
+                    else if (position == 3) uploadMode = "png";
+                    else if (position == 4) uploadMode = "original";
                     else uploadMode = "smart";
                 }));
         panel.addView(spinnerRow("长边", new String[]{"1536", "2048", "3072", "4096"}, 3,
@@ -307,6 +320,22 @@ public class MainActivity extends Activity {
                 (parent, position) -> timeoutSeconds = Integer.parseInt((String) parent.getItemAtPosition(position))));
         panel.addView(spinnerRow("处理次数", new String[]{"1", "2", "3", "4", "5", "10"}, 0,
                 (parent, position) -> repeatCount = Integer.parseInt((String) parent.getItemAtPosition(position))));
+        panel.addView(spinnerRow("步数", new String[]{"8", "12", "16", "20", "28", "50"}, 0,
+                (parent, position) -> steps = (String) parent.getItemAtPosition(position)));
+        panel.addView(spinnerRow("CFG", new String[]{"1.0", "3.0", "5.0", "7.5", "10.0"}, 0,
+                (parent, position) -> cfgScale = (String) parent.getItemAtPosition(position)));
+
+        LinearLayout advancedRow = horizontal();
+        textModeCheck = new CheckBox(this);
+        textModeCheck.setText("文字模式");
+        advancedRow.addView(textModeCheck, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        seedInput = new EditText(this);
+        seedInput.setSingleLine(true);
+        seedInput.setHint("Seed");
+        seedInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        seedInput.setBackgroundResource(getResources().getIdentifier("edit_text_bg", "drawable", getPackageName()));
+        advancedRow.addView(seedInput, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        panel.addView(advancedRow, lpMatchWrap(0, 6, 0, 0));
 
         LinearLayout row = horizontal();
         editButton = primaryButton("开始编辑");
@@ -404,7 +433,8 @@ public class MainActivity extends Activity {
     private void startEdit() {
         String apiKey = apiKeyInput.getText().toString().trim();
         String prompt = promptInput.getText().toString().trim();
-        if (!validateCommon(apiKey, prompt)) {
+        EditOptions options = currentEditOptions();
+        if (!validateCommon(apiKey, prompt, options)) {
             return;
         }
         if (selectedImageUri == null) {
@@ -412,13 +442,14 @@ public class MainActivity extends Activity {
             return;
         }
         maybeSaveKey(apiKey);
-        runSingleEditRequest(apiKey, prompt, selectedImageUri, repeatCount);
+        runSingleEditRequest(apiKey, prompt, selectedImageUri, repeatCount, options);
     }
 
     private void startBatchEdit() {
         String apiKey = apiKeyInput.getText().toString().trim();
         String prompt = promptInput.getText().toString().trim();
-        if (!validateCommon(apiKey, prompt)) {
+        EditOptions options = currentEditOptions();
+        if (!validateCommon(apiKey, prompt, options)) {
             return;
         }
         if (selectedFolderUri == null) {
@@ -426,10 +457,20 @@ public class MainActivity extends Activity {
             return;
         }
         maybeSaveKey(apiKey);
-        runBatchRequest(apiKey, prompt, selectedFolderUri, repeatCount);
+        runBatchRequest(apiKey, prompt, selectedFolderUri, repeatCount, options);
     }
 
-    private boolean validateCommon(String apiKey, String prompt) {
+    private EditOptions currentEditOptions() {
+        return new EditOptions(
+                negativePromptInput.getText().toString().trim(),
+                textModeCheck.isChecked(),
+                seedInput.getText().toString().trim(),
+                steps,
+                cfgScale
+        );
+    }
+
+    private boolean validateCommon(String apiKey, String prompt, EditOptions options) {
         if (apiKey.isEmpty()) {
             toast("请先填写 API Key");
             return false;
@@ -440,6 +481,14 @@ public class MainActivity extends Activity {
         }
         if (prompt.length() > 512) {
             toast("提示词最多 512 个字符");
+            return false;
+        }
+        if (options.negativePrompt.length() > 512) {
+            toast("负面提示词最多 512 个字符");
+            return false;
+        }
+        if (!options.seed.isEmpty() && !options.seed.matches("\\d+")) {
+            toast("Seed 请填写非负整数，或留空");
             return false;
         }
         return true;
@@ -458,7 +507,8 @@ public class MainActivity extends Activity {
                     "当前处理：" + describeOutputBytes("api_test.png", png)
             ));
             UploadFile testFile = new UploadFile("image", "api_test.png", "image/png", png);
-            return sendEditRequest(apiKey, "把蓝色方块改成红色方块", testFile, timeoutSeconds);
+            return sendEditRequest(apiKey, "把蓝色方块改成红色方块", testFile, timeoutSeconds,
+                    new EditOptions("", false, "1", "8", "1.0"));
         });
     }
 
@@ -479,13 +529,13 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 mainHandler.post(() -> {
                     setBusy(false, "失败", false);
-                    toast(safeMessage(e));
+                    showFailure(e);
                 });
             }
         });
     }
 
-    private void runSingleEditRequest(String apiKey, String prompt, Uri imageUri, int repeats) {
+    private void runSingleEditRequest(String apiKey, String prompt, Uri imageUri, int repeats, EditOptions options) {
         int total = Math.max(1, repeats);
         setBusy(true, "请求中...", false);
         executor.execute(() -> {
@@ -496,7 +546,7 @@ public class MainActivity extends Activity {
                     mainHandler.post(() -> statusView.setText(
                             total == 1 ? "请求中..." : "处理中 " + currentAttempt + "/" + total
                     ));
-                    byte[] result = editImage(apiKey, prompt, imageUri);
+                    byte[] result = editImage(apiKey, prompt, imageUri, options);
                     lastOut = saveOutput(result, total == 1 ? "" : String.format(Locale.US, "-%02d", attempt));
                     File displayOut = lastOut;
                     mainHandler.post(() -> {
@@ -518,13 +568,13 @@ public class MainActivity extends Activity {
             } catch (Exception e) {
                 mainHandler.post(() -> {
                     setBusy(false, "失败", false);
-                    toast(safeMessage(e));
+                    showFailure(e);
                 });
             }
         });
     }
 
-    private void runBatchRequest(String apiKey, String prompt, Uri folderUri, int repeats) {
+    private void runBatchRequest(String apiKey, String prompt, Uri folderUri, int repeats, EditOptions options) {
         setBusy(true, "准备批量处理...", true);
         executor.execute(() -> {
             int success = 0;
@@ -558,7 +608,7 @@ public class MainActivity extends Activity {
                             currentInfoView.setText("当前处理：" + describeUri(image.uri, image.name, image.size));
                         });
                         try {
-                            byte[] result = editImage(apiKey, prompt, image.uri);
+                            byte[] result = editImage(apiKey, prompt, image.uri, options);
                             String outputName = batchOutputName(image.name, currentRepeat, totalRepeats);
                             Uri outUri = saveOutputDocument(outputDirUri, outputName, result);
                             success++;
@@ -595,30 +645,39 @@ public class MainActivity extends Activity {
             } catch (Exception exc) {
                 mainHandler.post(() -> {
                     setBusy(false, "失败", false);
-                    toast(safeMessage(exc));
+                    showFailure(exc);
                 });
             }
         });
     }
 
-    private byte[] editImage(String apiKey, String prompt, Uri imageUri) throws Exception {
+    private byte[] editImage(String apiKey, String prompt, Uri imageUri, EditOptions options) throws Exception {
         mainHandler.post(() -> currentInfoView.setText("当前处理：" + describeUri(imageUri)));
         PreparedUpload upload = prepareUploadFile(imageUri);
         mainHandler.post(() -> currentInfoView.setText(
                 "当前处理：" + describeUri(imageUri) + "\n上传适配：" + upload.summary
         ));
-        byte[] result = sendEditRequest(apiKey, prompt, upload.file, timeoutSeconds);
+        byte[] result = sendEditRequest(apiKey, prompt, upload.file, timeoutSeconds, options);
         return cropResultIfNeeded(result, upload);
     }
 
-    private byte[] sendEditRequest(String apiKey, String prompt, UploadFile file, int timeout) throws Exception {
+    private byte[] sendEditRequest(String apiKey, String prompt, UploadFile file, int timeout, EditOptions options) throws Exception {
         String boundary = "----step-android-" + UUID.randomUUID();
         ByteArrayOutputStream body = new ByteArrayOutputStream();
         addFormField(body, boundary, "model", MODEL);
         addFormField(body, boundary, "prompt", prompt);
         addFormField(body, boundary, "response_format", "b64_json");
-        addFormField(body, boundary, "cfg_scale", "1.0");
-        addFormField(body, boundary, "steps", "8");
+        addFormField(body, boundary, "cfg_scale", options.cfgScale);
+        addFormField(body, boundary, "steps", options.steps);
+        if (!options.negativePrompt.isEmpty()) {
+            addFormField(body, boundary, "negative_prompt", options.negativePrompt);
+        }
+        if (options.textMode) {
+            addFormField(body, boundary, "text_mode", "true");
+        }
+        if (!options.seed.isEmpty()) {
+            addFormField(body, boundary, "seed", options.seed);
+        }
         addFileField(body, boundary, file);
         body.write(("--" + boundary + "--\r\n").getBytes(StandardCharsets.UTF_8));
 
@@ -638,7 +697,7 @@ public class MainActivity extends Activity {
         InputStream stream = code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream();
         String response = new String(readAll(stream), StandardCharsets.UTF_8);
         if (code < 200 || code >= 300) {
-            throw new Exception("HTTP " + code + ": " + response);
+            throw new Exception(classifyError("HTTP " + code + ": " + extractErrorText(response)));
         }
         return parseImageResponse(response);
     }
@@ -656,6 +715,9 @@ public class MainActivity extends Activity {
         int[] size = getImageSize(uri);
         boolean canUseOriginal = "original".equals(uploadMode)
                 || ("smart".equals(uploadMode)
+                && size != null
+                && Math.max(size[0], size[1]) <= maxSide)
+                || ("compatible".equals(uploadMode)
                 && size != null
                 && Math.max(size[0], size[1]) <= maxSide
                 && isAligned(size[0])
@@ -677,6 +739,30 @@ public class MainActivity extends Activity {
         Bitmap scaled = scaleBitmap(source, maxSide);
         if (scaled != source) {
             source.recycle();
+        }
+
+        if (!"compatible".equals(uploadMode)) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            String filename;
+            String mime;
+            boolean usePng = "png".equals(uploadMode)
+                    || ("smart".equals(uploadMode)
+                    && (scaled.hasAlpha() || originalMime.toLowerCase(Locale.ROOT).contains("png")));
+            if (usePng) {
+                scaled.compress(Bitmap.CompressFormat.PNG, 100, out);
+                filename = "image.png";
+                mime = "image/png";
+            } else {
+                scaled.compress(Bitmap.CompressFormat.JPEG, 95, out);
+                filename = "image.jpg";
+                mime = "image/jpeg";
+            }
+            int scaledWidth = scaled.getWidth();
+            int scaledHeight = scaled.getHeight();
+            scaled.recycle();
+            UploadFile file = new UploadFile("image", filename, mime, out.toByteArray());
+            String summary = "等比缩放上传 " + scaledWidth + "x" + scaledHeight + "，不补边";
+            return new PreparedUpload(file, scaledWidth, scaledHeight, scaledWidth, scaledHeight, 0, 0, false, summary);
         }
 
         NormalizedSize normalized = chooseNormalizedSize(scaled.getWidth(), scaled.getHeight());
@@ -1291,7 +1377,126 @@ public class MainActivity extends Activity {
 
     private String safeMessage(Exception exc) {
         String message = exc.getMessage();
-        return message == null || message.trim().isEmpty() ? "请求失败" : message;
+        return classifyError(message == null || message.trim().isEmpty() ? "请求失败" : message);
+    }
+
+    private void showFailure(Exception exc) {
+        String message = safeMessage(exc);
+        statusView.setText(firstLine(message));
+        outputInfoView.setText(message);
+        toast(firstLine(message));
+    }
+
+    private String firstLine(String message) {
+        if (message == null || message.trim().isEmpty()) {
+            return "请求失败";
+        }
+        int newline = message.indexOf('\n');
+        return newline >= 0 ? message.substring(0, newline) : message;
+    }
+
+    private String extractErrorText(String detail) {
+        if (detail == null || detail.trim().isEmpty()) {
+            return "";
+        }
+        try {
+            JSONObject root = new JSONObject(detail);
+            if (root.has("error")) {
+                Object error = root.get("error");
+                if (error instanceof JSONObject) {
+                    JSONObject errorObject = (JSONObject) error;
+                    List<String> parts = new ArrayList<>();
+                    for (String key : new String[]{"message", "code", "type", "param"}) {
+                        if (errorObject.has(key) && !errorObject.isNull(key)) {
+                            parts.add(errorObject.optString(key));
+                        }
+                    }
+                    if (!parts.isEmpty()) {
+                        return joinParts(parts);
+                    }
+                } else {
+                    return String.valueOf(error);
+                }
+            }
+            for (String key : new String[]{"message", "msg", "detail", "code"}) {
+                if (root.has(key) && !root.isNull(key)) {
+                    return root.optString(key);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return detail;
+    }
+
+    private String classifyError(String message) {
+        String text = message == null ? "" : message.trim();
+        String lower = text.toLowerCase(Locale.ROOT);
+        if (text.contains("\n\n原始详情：\n") && (
+                text.startsWith("请求超时")
+                        || text.startsWith("认证失败")
+                        || text.startsWith("权限不足")
+                        || text.startsWith("限流或额度不足")
+                        || text.startsWith("参数或格式错误")
+                        || text.startsWith("平台审核未通过")
+                        || text.startsWith("平台服务异常")
+                        || text.startsWith("网络连接失败")
+                        || text.startsWith("请求失败"))) {
+            return text;
+        }
+        String category;
+        String advice;
+
+        if (text.contains("请求超过") || lower.contains("timeout") || lower.contains("timed out")) {
+            category = "请求超时";
+            advice = "可以调高超时、减小图片尺寸，或稍后重试。";
+        } else if (text.contains("401") || lower.contains("unauthorized") || lower.contains("invalid api key")) {
+            category = "认证失败";
+            advice = "请检查 API Key 是否正确、是否过期，或账号是否有权限。";
+        } else if (text.contains("403") || lower.contains("forbidden") || lower.contains("permission")) {
+            category = "权限不足";
+            advice = "请检查账号权限、模型权限或平台访问限制。";
+        } else if (text.contains("429") || lower.contains("rate limit") || lower.contains("too many") || lower.contains("quota")) {
+            category = "限流或额度不足";
+            advice = "请稍后重试，或检查账号额度和并发限制。";
+        } else if (text.contains("审核") || text.contains("敏感") || text.contains("违规")
+                || text.contains("不合规") || text.contains("安全") || lower.contains("sensitive")
+                || lower.contains("safety") || lower.contains("policy") || lower.contains("moderation")
+                || lower.contains("content")) {
+            category = "平台审核未通过";
+            advice = "请调整为更清楚、合规的编辑描述，避免容易触发审核的表达。";
+        } else if (text.contains("400") || lower.contains("invalid") || lower.contains("bad request")
+                || lower.contains("param") || lower.contains("parameter") || text.contains("字段")
+                || text.contains("参数") || text.contains("最多 512")) {
+            category = "参数或格式错误";
+            advice = "请检查提示词长度、Seed、图片格式、图片尺寸和请求参数。";
+        } else if (lower.contains("http 5") || text.contains("500") || text.contains("502")
+                || text.contains("503") || text.contains("504")) {
+            category = "平台服务异常";
+            advice = "通常是服务端临时问题，可以稍后重试。";
+        } else if (lower.contains("connection") || lower.contains("dns") || lower.contains("unknownhost")
+                || lower.contains("network")) {
+            category = "网络连接失败";
+            advice = "请检查网络、代理设置。";
+        } else {
+            category = "请求失败";
+            advice = "请查看原始详情定位原因。";
+        }
+
+        return category + "\n" + advice + "\n\n原始详情：\n" + (text.isEmpty() ? "无" : text);
+    }
+
+    private String joinParts(List<String> parts) {
+        StringBuilder builder = new StringBuilder();
+        for (String part : parts) {
+            if (part == null || part.trim().isEmpty()) {
+                continue;
+            }
+            if (builder.length() > 0) {
+                builder.append(" | ");
+            }
+            builder.append(part);
+        }
+        return builder.toString();
     }
 
     private LinearLayout panel() {
@@ -1381,6 +1586,22 @@ public class MainActivity extends Activity {
 
     private interface SelectionHandler {
         void onSelected(AdapterView<?> parent, int position);
+    }
+
+    private static class EditOptions {
+        final String negativePrompt;
+        final boolean textMode;
+        final String seed;
+        final String steps;
+        final String cfgScale;
+
+        EditOptions(String negativePrompt, boolean textMode, String seed, String steps, String cfgScale) {
+            this.negativePrompt = negativePrompt == null ? "" : negativePrompt;
+            this.textMode = textMode;
+            this.seed = seed == null ? "" : seed;
+            this.steps = steps == null || steps.isEmpty() ? "8" : steps;
+            this.cfgScale = cfgScale == null || cfgScale.isEmpty() ? "1.0" : cfgScale;
+        }
     }
 
     private static class UploadFile {

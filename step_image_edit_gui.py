@@ -80,6 +80,10 @@ def delete_env_key():
 
 
 def normalize_upload_mode(label):
+    if label == "原图优先":
+        return "smart"
+    if label == "兼容补边":
+        return "compatible"
     if label == "智能高质量":
         return "smart"
     if label == "无损PNG":
@@ -90,6 +94,8 @@ def normalize_upload_mode(label):
 
 
 def normalize_quality_mode(label):
+    if str(label).strip().isdigit():
+        return str(label).strip()
     if label == "精细":
         return "16"
     if label == "更稳":
@@ -325,9 +331,26 @@ def prepare_upload_image(path, upload_mode, max_side):
             log_message(f"smart upload original, dimension unknown: {image_path.name}")
             return str(image_path), None
         width, height = dimensions
-        if max(width, height) <= max_side and is_aligned(width) and is_aligned(height):
+        if max(width, height) <= max_side:
             log_message(
                 f"smart upload original: {image_path.name} "
+                f"({width}x{height}, {image_path.stat().st_size / 1024 / 1024:.2f}MB)"
+            )
+            return str(image_path), None
+        log_message(
+            f"smart upload resize needed: {image_path.name} "
+            f"({width}x{height}) exceeds max_side={max_side}"
+        )
+        upload_mode = "png" if suffix == ".png" else "jpg95"
+
+    if upload_mode == "compatible":
+        if not dimensions:
+            log_message(f"compatible upload original, dimension unknown: {image_path.name}")
+            return str(image_path), None
+        width, height = dimensions
+        if max(width, height) <= max_side and is_aligned(width) and is_aligned(height):
+            log_message(
+                f"compatible upload original: {image_path.name} "
                 f"({width}x{height}, {image_path.stat().st_size / 1024 / 1024:.2f}MB)"
             )
             return str(image_path), None
@@ -377,7 +400,7 @@ def prepare_upload_image(path, upload_mode, max_side):
             if proc.returncode == 0 and out_path.exists():
                 summary = proc.stdout.strip()
                 log_message(
-                    "smart upload normalized: "
+                    "compatible upload normalized: "
                     f"{image_path.name} {width}x{height} -> "
                     f"{normalized['target_width']}x{normalized['target_height']}; "
                     f"crop back {content_width}x{content_height}; {normalized['summary']}; {summary}"
@@ -565,6 +588,102 @@ def request_multipart(url, api_key, fields, files, timeout, network_mode="direct
     return send_request(req, timeout, network_mode)
 
 
+def extract_error_text(detail):
+    text = str(detail or "").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return text
+
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            parts = [
+                error.get("message"),
+                error.get("code"),
+                error.get("type"),
+                error.get("param"),
+            ]
+            return " | ".join(str(part) for part in parts if part)
+        if isinstance(error, str):
+            return error
+        for key in ("message", "msg", "detail", "code"):
+            value = payload.get(key)
+            if value:
+                return str(value)
+    return text
+
+
+def classify_error(message):
+    text = str(message or "")
+    lowered = text.lower()
+    known_categories = (
+        "请求超时",
+        "认证失败",
+        "权限不足",
+        "限流或额度不足",
+        "参数或格式错误",
+        "平台审核未通过",
+        "平台服务异常",
+        "网络连接失败",
+        "请求失败",
+    )
+    if "\n\n原始详情：\n" in text and text.startswith(known_categories):
+        return text
+
+    if "请求超过" in text or "timeout" in lowered or "timed out" in lowered:
+        category = "请求超时"
+        advice = "可以调高超时、减小图片尺寸，或稍后重试。"
+    elif "401" in text or "unauthorized" in lowered or "invalid api key" in lowered:
+        category = "认证失败"
+        advice = "请检查 API Key 是否正确、是否过期，或账号是否有权限。"
+    elif "403" in text or "forbidden" in lowered or "permission" in lowered:
+        category = "权限不足"
+        advice = "请检查账号权限、模型权限或平台访问限制。"
+    elif "429" in text or "rate limit" in lowered or "too many" in lowered or "quota" in lowered:
+        category = "限流或额度不足"
+        advice = "请稍后重试，或检查账号额度和并发限制。"
+    elif (
+        "审核" in text
+        or "敏感" in text
+        or "违规" in text
+        or "不合规" in text
+        or "安全" in text
+        or "sensitive" in lowered
+        or "safety" in lowered
+        or "policy" in lowered
+        or "moderation" in lowered
+        or "content" in lowered
+    ):
+        category = "平台审核未通过"
+        advice = "请调整为更清楚、合规的编辑描述，避免容易触发审核的表达。"
+    elif (
+        "400" in text
+        or "invalid" in lowered
+        or "bad request" in lowered
+        or "param" in lowered
+        or "parameter" in lowered
+        or "字段" in text
+        or "参数" in text
+        or "最多 512" in text
+    ):
+        category = "参数或格式错误"
+        advice = "请检查提示词长度、Seed、图片格式、图片尺寸和请求参数。"
+    elif "http 5" in lowered or "500" in text or "502" in text or "503" in text or "504" in text:
+        category = "平台服务异常"
+        advice = "通常是服务端临时问题，可以稍后重试。"
+    elif "网络请求失败" in text or "urlerror" in lowered or "connection" in lowered or "dns" in lowered:
+        category = "网络连接失败"
+        advice = "请检查网络、代理设置，或切换直连/系统代理。"
+    else:
+        category = "请求失败"
+        advice = "请查看原始详情和日志定位原因。"
+
+    return f"{category}\n{advice}\n\n原始详情：\n{text.strip() or '无'}"
+
+
 def send_request(req, timeout, network_mode="direct"):
     proxies = urllib.request.getproxies()
     proxy_text = "disabled" if network_mode == "direct" else str(proxies)
@@ -613,15 +732,17 @@ def send_request(req, timeout, network_mode="direct"):
         if kind == "http":
             detail = result.get("detail", "")
             code = result.get("code", "")
+            extracted = extract_error_text(detail)
+            raw = f"HTTP {code}: {extracted or detail}"
             log_message(f"HTTP {code}: {detail}")
-            raise RuntimeError(f"HTTP {code}: {detail}")
+            raise RuntimeError(classify_error(raw))
         if kind == "timeout":
             detail = result.get("detail", f"请求超过 {timeout} 秒仍未返回，已自动停止。")
             log_message("Request timed out")
-            raise RuntimeError(detail)
+            raise RuntimeError(classify_error(detail))
         detail = result.get("detail", "未知网络错误")
         log_message(f"Network error: {detail}")
-        raise RuntimeError(f"网络请求失败或超时：{detail}")
+        raise RuntimeError(classify_error(f"网络请求失败或超时：{detail}"))
 
     raw = result["raw"]
     content_type = result.get("content_type", "")
@@ -768,8 +889,11 @@ class StepImageEditApp:
         self.auto_resize = BooleanVar(value=True)
         self.remember_key = BooleanVar(value=True)
         self.max_side = StringVar(value="4096")
-        self.upload_mode = StringVar(value="智能高质量")
+        self.upload_mode = StringVar(value="原图优先")
         self.quality_mode = StringVar(value="标准")
+        self.cfg_scale = StringVar(value="1.0")
+        self.seed = StringVar()
+        self.text_mode = BooleanVar(value=False)
         self.timeout_seconds = StringVar(value="300")
         self.repeat_count = StringVar(value="1")
         self.network_mode = StringVar(value="直连")
@@ -880,7 +1004,7 @@ class StepImageEditApp:
         ttk.Combobox(
             settings,
             textvariable=self.upload_mode,
-            values=["智能高质量", "高质JPG", "无损PNG", "原图"],
+            values=["原图优先", "兼容补边", "高质JPG", "无损PNG", "原图"],
             width=12,
             state="readonly",
         ).pack(side="left", padx=(0, 10))
@@ -896,7 +1020,7 @@ class StepImageEditApp:
         ttk.Combobox(
             settings,
             textvariable=self.quality_mode,
-            values=["标准", "更稳", "精细"],
+            values=["标准", "更稳", "精细", "20", "28", "50"],
             width=8,
             state="readonly",
         ).pack(side="left", padx=8)
@@ -925,10 +1049,28 @@ class StepImageEditApp:
             state="readonly",
         ).pack(side="left", padx=8)
 
+        advanced = ttk.Frame(self.edit_tab)
+        advanced.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(advanced, text="文字模式", variable=self.text_mode).pack(side="left")
+        ttk.Label(advanced, text="CFG").pack(side="left", padx=(18, 0))
+        ttk.Combobox(
+            advanced,
+            textvariable=self.cfg_scale,
+            values=["1.0", "3.0", "5.0", "7.5", "10.0"],
+            width=8,
+            state="readonly",
+        ).pack(side="left", padx=8)
+        ttk.Label(advanced, text="Seed").pack(side="left", padx=(12, 0))
+        ttk.Entry(advanced, textvariable=self.seed, width=16).pack(side="left", padx=8)
+
         ttk.Label(self.edit_tab, text="编辑提示词").pack(anchor="w", pady=(14, 6))
         self.edit_prompt = ScrolledText(self.edit_tab, height=8, wrap="word")
         self.edit_prompt.pack(fill="both", expand=True)
         self.edit_prompt.insert("1.0", "把背景换成干净的白色摄影棚，保持主体不变")
+
+        ttk.Label(self.edit_tab, text="负面提示词").pack(anchor="w", pady=(10, 6))
+        self.negative_prompt = ScrolledText(self.edit_tab, height=3, wrap="word")
+        self.negative_prompt.pack(fill="x")
 
         action_row = ttk.Frame(self.edit_tab)
         action_row.pack(fill="x", pady=(12, 0))
@@ -1108,6 +1250,8 @@ class StepImageEditApp:
             return
         self.maybe_save_api_key(key)
         prompt = self.edit_prompt.get("1.0", "end").strip()
+        negative_prompt = self.negative_prompt.get("1.0", "end").strip()
+        seed = self.seed.get().strip()
         image = self.image_path.get().strip()
         mask = self.mask_path.get().strip()
         use_mask = self.use_mask.get()
@@ -1130,6 +1274,12 @@ class StepImageEditApp:
         if len(prompt) > 512:
             messagebox.showwarning("提示词太长", "Step Image Edit 2 的提示词最多 512 个字符。")
             return
+        if len(negative_prompt) > 512:
+            messagebox.showwarning("负面提示词太长", "负面提示词最多 512 个字符。")
+            return
+        if seed and not seed.isdigit():
+            messagebox.showwarning("Seed 格式错误", "Seed 请填写非负整数，或留空。")
+            return
         if use_mask and mask and not Path(mask).exists():
             messagebox.showwarning("蒙版不存在", "选择的蒙版文件不存在。")
             return
@@ -1137,12 +1287,16 @@ class StepImageEditApp:
         config = {
             "api_key": key,
             "prompt": prompt,
+            "negative_prompt": negative_prompt,
             "image": image,
             "mask": mask if use_mask else "",
             "response_format": response_format,
             "upload_mode": upload_mode,
             "max_side": max_side,
             "steps": steps,
+            "cfg_scale": self.cfg_scale.get(),
+            "seed": seed,
+            "text_mode": self.text_mode.get(),
             "timeout": timeout,
             "repeat": int(self.repeat_count.get()),
             "network_mode": network_mode,
@@ -1160,6 +1314,8 @@ class StepImageEditApp:
         self.maybe_save_api_key(key)
 
         prompt = self.edit_prompt.get("1.0", "end").strip()
+        negative_prompt = self.negative_prompt.get("1.0", "end").strip()
+        seed = self.seed.get().strip()
         folder = self.folder_path.get().strip()
         if not folder:
             messagebox.showwarning("缺少文件夹", "请先选择要批量处理的图片文件夹。")
@@ -1174,6 +1330,12 @@ class StepImageEditApp:
         if len(prompt) > 512:
             messagebox.showwarning("提示词太长", "Step Image Edit 2 的提示词最多 512 个字符。")
             return
+        if len(negative_prompt) > 512:
+            messagebox.showwarning("负面提示词太长", "负面提示词最多 512 个字符。")
+            return
+        if seed and not seed.isdigit():
+            messagebox.showwarning("Seed 格式错误", "Seed 请填写非负整数，或留空。")
+            return
 
         images = self.find_folder_images(folder_path)
         if not images:
@@ -1186,12 +1348,16 @@ class StepImageEditApp:
         config = {
             "api_key": key,
             "prompt": prompt,
+            "negative_prompt": negative_prompt,
             "images": images,
             "output_dir": output_dir,
             "response_format": self.response_format.get(),
             "upload_mode": upload_mode,
             "max_side": self.max_side.get(),
             "steps": normalize_quality_mode(self.quality_mode.get()),
+            "cfg_scale": self.cfg_scale.get(),
+            "seed": seed,
+            "text_mode": self.text_mode.get(),
             "timeout": int(self.timeout_seconds.get()),
             "repeat": int(self.repeat_count.get()),
             "network_mode": network_mode,
@@ -1251,6 +1417,9 @@ class StepImageEditApp:
             "response_format": "b64_json",
             "upload_mode": "original",
             "steps": "8",
+            "cfg_scale": "1.0",
+            "seed": "1",
+            "text_mode": False,
             "timeout": min(int(self.timeout_seconds.get()), 75),
             "is_test": True,
             "network_mode": normalize_network_mode(self.network_mode.get()),
@@ -1289,9 +1458,15 @@ class StepImageEditApp:
             "model": MODEL_NAME,
             "prompt": config["prompt"],
             "response_format": config["response_format"],
-            "cfg_scale": "1.0",
+            "cfg_scale": config.get("cfg_scale", "1.0"),
             "steps": config.get("steps", "8"),
         }
+        if config.get("negative_prompt"):
+            fields["negative_prompt"] = config["negative_prompt"]
+        if config.get("text_mode"):
+            fields["text_mode"] = "true"
+        if config.get("seed"):
+            fields["seed"] = config["seed"]
         if config.get("is_test"):
             fields["seed"] = "1"
         files = {"image": config["image"]}
@@ -1557,8 +1732,9 @@ class StepImageEditApp:
         self.pause_button.configure(state="disabled", text="暂停")
         self.stop_button.configure(state="disabled")
         self.progress.stop()
-        self.status.configure(text="失败")
-        messagebox.showerror("请求失败", message)
+        friendly = classify_error(message)
+        self.status.configure(text=friendly.splitlines()[0] if friendly else "失败")
+        messagebox.showerror("请求失败", friendly)
 
     def open_output(self):
         path = self.output_path.get().strip()
