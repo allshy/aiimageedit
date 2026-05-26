@@ -4,6 +4,7 @@ import mimetypes
 import multiprocessing
 import os
 import queue
+import random
 import subprocess
 import threading
 import time
@@ -126,6 +127,18 @@ def describe_image_file(path):
     return f"{file_path.name} | {suffix.upper()} | {size_mb:.2f} MB"
 
 
+def result_path(result):
+    if isinstance(result, dict):
+        return Path(result["path"])
+    return Path(result)
+
+
+def result_seed(result):
+    if isinstance(result, dict):
+        return result.get("seed", "")
+    return ""
+
+
 def unique_path(path):
     path = Path(path)
     if not path.exists():
@@ -141,6 +154,10 @@ def safe_stem(path):
     stem = Path(path).stem.strip()
     cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in stem)
     return cleaned or "image"
+
+
+def generate_seed():
+    return str(random.randint(0, 2_147_483_647))
 
 
 def align_up(value, alignment=DIMENSION_ALIGNMENT):
@@ -1296,6 +1313,7 @@ class StepImageEditApp:
             "steps": steps,
             "cfg_scale": self.cfg_scale.get(),
             "seed": seed,
+            "seed_auto": not bool(seed),
             "text_mode": self.text_mode.get(),
             "timeout": timeout,
             "repeat": int(self.repeat_count.get()),
@@ -1357,6 +1375,7 @@ class StepImageEditApp:
             "steps": normalize_quality_mode(self.quality_mode.get()),
             "cfg_scale": self.cfg_scale.get(),
             "seed": seed,
+            "seed_auto": not bool(seed),
             "text_mode": self.text_mode.get(),
             "timeout": int(self.timeout_seconds.get()),
             "repeat": int(self.repeat_count.get()),
@@ -1419,6 +1438,7 @@ class StepImageEditApp:
             "steps": "8",
             "cfg_scale": "1.0",
             "seed": "1",
+            "seed_auto": False,
             "text_mode": False,
             "timeout": min(int(self.timeout_seconds.get()), 75),
             "is_test": True,
@@ -1450,9 +1470,13 @@ class StepImageEditApp:
 
     def edit_image(self, config):
         image_path = Path(config["image"])
+        actual_seed = str(config.get("seed") or generate_seed())
+        config["actual_seed"] = actual_seed
         self.root.after(
             0,
-            lambda p=image_path: self.current_info.set(f"当前处理：{describe_image_file(p)}"),
+            lambda p=image_path, seed=actual_seed: self.current_info.set(
+                f"当前处理：{describe_image_file(p)}\n本次 Seed：{seed}"
+            ),
         )
         fields = {
             "model": MODEL_NAME,
@@ -1465,10 +1489,11 @@ class StepImageEditApp:
             fields["negative_prompt"] = config["negative_prompt"]
         if config.get("text_mode"):
             fields["text_mode"] = "true"
-        if config.get("seed"):
-            fields["seed"] = config["seed"]
+        fields["seed"] = actual_seed
         if config.get("is_test"):
             fields["seed"] = "1"
+            actual_seed = "1"
+            config["actual_seed"] = actual_seed
         files = {"image": config["image"]}
         upload_path, crop_info = prepare_upload_image(
             config["image"],
@@ -1479,9 +1504,10 @@ class StepImageEditApp:
         if crop_info:
             self.root.after(
                 0,
-                lambda info=crop_info, path=upload_path: self.current_info.set(
+                lambda info=crop_info, path=upload_path, seed=actual_seed: self.current_info.set(
                     "当前处理："
                     f"{describe_image_file(image_path)}\n"
+                    f"本次 Seed：{seed}\n"
                     f"上传适配：{describe_image_file(path)}，返回后裁回 "
                     f"{info['content_width']}x{info['content_height']}"
                 ),
@@ -1506,11 +1532,14 @@ class StepImageEditApp:
             network_mode=config.get("network_mode", "direct"),
         )
         result_path = crop_result_file(result_path, crop_info)
+        log_message(f"edit success: {image_path.name}; seed={actual_seed}; output={result_path}")
         self.root.after(
             0,
-            lambda p=result_path: self.output_info.set(f"输出图片：{describe_image_file(p)}"),
+            lambda p=result_path, seed=actual_seed: self.output_info.set(
+                f"输出图片：{describe_image_file(p)} | Seed: {seed}"
+            ),
         )
-        return result_path
+        return {"path": result_path, "seed": actual_seed}
 
     def repeat_edit_image(self, config):
         repeat = max(1, int(config.get("repeat", 1)))
@@ -1543,8 +1572,10 @@ class StepImageEditApp:
             "type": "repeat",
             "success": len(results),
             "total": repeat,
-            "last_result": results[-1],
-            "output_dir": results[-1].parent,
+            "last_result": result_path(results[-1]),
+            "last_seed": result_seed(results[-1]),
+            "seeds": [result_seed(item) for item in results],
+            "output_dir": result_path(results[-1]).parent,
             "stopped": self.stop_event.is_set(),
         }
 
@@ -1598,9 +1629,12 @@ class StepImageEditApp:
                     item_config["output_stem"] = f"{safe_stem(image)}-edited"
                 try:
                     result = self.edit_image(item_config)
+                    result_file = result_path(result)
+                    seed_used = result_seed(result)
                     successes.append(result)
                     log_message(
-                        f"batch success: {image.name} repeat={repeat_index}/{repeat} -> {result}"
+                        f"batch success: {image.name} repeat={repeat_index}/{repeat}; "
+                        f"seed={seed_used} -> {result_file}"
                     )
                 except Exception as exc:
                     error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
@@ -1706,7 +1740,8 @@ class StepImageEditApp:
             last_result = result_path["last_result"]
             if last_result:
                 self.output_path.set(str(last_result))
-                self.output_info.set(f"输出图片：{describe_image_file(last_result)}")
+                seed_text = f" | Seed: {result_path.get('last_seed')}" if result_path.get("last_seed") else ""
+                self.output_info.set(f"输出图片：{describe_image_file(last_result)}{seed_text}")
             prefix = "已停止" if result_path.get("stopped") else "完成"
             self.status.configure(text=f"{prefix}：生成 {result_path['success']} 张")
             try:
@@ -1715,11 +1750,17 @@ class StepImageEditApp:
                 pass
             return
 
-        self.output_path.set(str(result_path))
-        self.output_info.set(f"输出图片：{describe_image_file(result_path)}")
+        if isinstance(result_path, dict):
+            path = result_path["path"]
+            seed_text = f" | Seed: {result_path.get('seed')}" if result_path.get("seed") else ""
+        else:
+            path = result_path
+            seed_text = ""
+        self.output_path.set(str(path))
+        self.output_info.set(f"输出图片：{describe_image_file(path)}{seed_text}")
         self.status.configure(text="完成")
         try:
-            os.startfile(result_path)
+            os.startfile(path)
         except OSError:
             pass
 

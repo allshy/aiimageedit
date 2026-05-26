@@ -52,6 +52,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -77,6 +78,7 @@ public class MainActivity extends Activity {
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Object pauseLock = new Object();
+    private final Random random = new Random();
 
     private EditText apiKeyInput;
     private EditText promptInput;
@@ -523,7 +525,7 @@ public class MainActivity extends Activity {
                     outputPreview.setImageURI(Uri.fromFile(out));
                     applyPreviewPrivacy();
                     outputPathView.setText(out.getAbsolutePath());
-                    outputInfoView.setText("输出图片：" + describeFile(out));
+                    outputInfoView.setText("输出图片：" + describeFile(out) + " | Seed: 1");
                     toast("已保存结果");
                 });
             } catch (Exception e) {
@@ -546,14 +548,15 @@ public class MainActivity extends Activity {
                     mainHandler.post(() -> statusView.setText(
                             total == 1 ? "请求中..." : "处理中 " + currentAttempt + "/" + total
                     ));
-                    byte[] result = editImage(apiKey, prompt, imageUri, options);
-                    lastOut = saveOutput(result, total == 1 ? "" : String.format(Locale.US, "-%02d", attempt));
+                    EditResult result = editImage(apiKey, prompt, imageUri, options.withSeed(resolveSeed(options)));
+                    lastOut = saveOutput(result.bytes, total == 1 ? "" : String.format(Locale.US, "-%02d", attempt));
                     File displayOut = lastOut;
+                    String seedText = result.seed;
                     mainHandler.post(() -> {
                         outputPreview.setImageURI(Uri.fromFile(displayOut));
                         applyPreviewPrivacy();
                         outputPathView.setText(displayOut.getAbsolutePath());
-                        outputInfoView.setText("输出图片：" + describeFile(displayOut));
+                        outputInfoView.setText("输出图片：" + describeFile(displayOut) + " | Seed: " + seedText);
                         statusView.setText(total == 1 ? "完成" : "已完成 " + currentAttempt + "/" + total);
                     });
                 }
@@ -608,13 +611,14 @@ public class MainActivity extends Activity {
                             currentInfoView.setText("当前处理：" + describeUri(image.uri, image.name, image.size));
                         });
                         try {
-                            byte[] result = editImage(apiKey, prompt, image.uri, options);
+                            EditResult result = editImage(apiKey, prompt, image.uri, options.withSeed(resolveSeed(options)));
                             String outputName = batchOutputName(image.name, currentRepeat, totalRepeats);
-                            Uri outUri = saveOutputDocument(outputDirUri, outputName, result);
+                            Uri outUri = saveOutputDocument(outputDirUri, outputName, result.bytes);
                             success++;
+                            String seedText = result.seed;
                             mainHandler.post(() -> {
                                 outputPathView.setText(outUri.toString());
-                                outputInfoView.setText("输出图片：" + describeOutputBytes(outputName, result));
+                                outputInfoView.setText("输出图片：" + describeOutputBytes(outputName, result.bytes) + " | Seed: " + seedText);
                             });
                         } catch (Exception exc) {
                             failures.add(image.name + " 第 " + currentRepeat + "/" + totalRepeats
@@ -651,14 +655,17 @@ public class MainActivity extends Activity {
         });
     }
 
-    private byte[] editImage(String apiKey, String prompt, Uri imageUri, EditOptions options) throws Exception {
-        mainHandler.post(() -> currentInfoView.setText("当前处理：" + describeUri(imageUri)));
+    private EditResult editImage(String apiKey, String prompt, Uri imageUri, EditOptions options) throws Exception {
+        String seedText = options.seed;
+        mainHandler.post(() -> currentInfoView.setText(
+                "当前处理：" + describeUri(imageUri) + "\n本次 Seed：" + seedText
+        ));
         PreparedUpload upload = prepareUploadFile(imageUri);
         mainHandler.post(() -> currentInfoView.setText(
-                "当前处理：" + describeUri(imageUri) + "\n上传适配：" + upload.summary
+                "当前处理：" + describeUri(imageUri) + "\n本次 Seed：" + seedText + "\n上传适配：" + upload.summary
         ));
         byte[] result = sendEditRequest(apiKey, prompt, upload.file, timeoutSeconds, options);
-        return cropResultIfNeeded(result, upload);
+        return new EditResult(cropResultIfNeeded(result, upload), seedText);
     }
 
     private byte[] sendEditRequest(String apiKey, String prompt, UploadFile file, int timeout, EditOptions options) throws Exception {
@@ -1387,6 +1394,13 @@ public class MainActivity extends Activity {
         toast(firstLine(message));
     }
 
+    private String resolveSeed(EditOptions options) {
+        if (!options.seed.isEmpty()) {
+            return options.seed;
+        }
+        return String.valueOf(random.nextInt(Integer.MAX_VALUE));
+    }
+
     private String firstLine(String message) {
         if (message == null || message.trim().isEmpty()) {
             return "请求失败";
@@ -1601,6 +1615,20 @@ public class MainActivity extends Activity {
             this.seed = seed == null ? "" : seed;
             this.steps = steps == null || steps.isEmpty() ? "8" : steps;
             this.cfgScale = cfgScale == null || cfgScale.isEmpty() ? "1.0" : cfgScale;
+        }
+
+        EditOptions withSeed(String seed) {
+            return new EditOptions(negativePrompt, textMode, seed, steps, cfgScale);
+        }
+    }
+
+    private static class EditResult {
+        final byte[] bytes;
+        final String seed;
+
+        EditResult(byte[] bytes, String seed) {
+            this.bytes = bytes;
+            this.seed = seed;
         }
     }
 
